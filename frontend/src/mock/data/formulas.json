@@ -1,0 +1,8 @@
+{
+  "call": "Simplified E-model: d = RTT/2 + 2 \u00d7 jitter + codec delay; Id = .024d + .11 max(0,d\u2212177.3); Ie_eff = Ie + (95\u2212Ie)Ppl/(Ppl+Bpl); R = 93.2\u2212Id\u2212Ie_eff; MOS = clip(1+.035R+7e\u22126R(R\u221260)(100\u2212R),1,4.5); QoE = (MOS\u22121)/3.5. Default codec delay 20 ms, Ie 0, Bpl 25.",
+  "game": "0.55 f(RTT;30,150) + 0.30 f(jitter;5,40) + 0.15 f(loss;0,2%). f decreases linearly from 1 to 0.",
+  "stream": "0.60 min(1, throughput/target) + 0.25 (1\u2212clip(CoV/0.5)) + 0.15 (1\u2212rebuffer proxy).",
+  "bulk": "min(1, progress rate / fair expected rate). A floor violation is reported separately.",
+  "household": "Device proxy = minimum of active flow proxies. Household proxy = mean of active-device proxies. Idle devices are excluded. Unknown inputs lower confidence.",
+  "fairness": "Jain index = (\u03a3x)\u00b2 / (n \u00d7 \u03a3x\u00b2), computed over active-device QoE proxies. This is not a subjective experience measurement."
+}

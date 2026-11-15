@@ -1,0 +1,2 @@
+import tseslint from 'typescript-eslint';
+export default tseslint.config({ ignores:['dist/**','node_modules/**','.figma/**'] },{files:['src/**/*.{ts,tsx}'],languageOptions:{parser:tseslint.parser},rules:{'no-restricted-imports':['error',{patterns:[{group:['**/mock','**/mock/**','@/mock','@/mock/**','src/mock/**'],message:'Only MockTransport may import the mock backend.'}]}]}},{files:['src/mock/**/*','src/lib/transport/MockTransport.ts'],rules:{'no-restricted-imports':'off'}});

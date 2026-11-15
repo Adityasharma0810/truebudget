@@ -1,0 +1,16 @@
+[
+  {
+    "id": "ses1",
+    "name": "This browser",
+    "location": "Local demo session",
+    "lastSeen": "Now",
+    "current": true
+  },
+  {
+    "id": "ses2",
+    "name": "Maya\u2019s tablet",
+    "location": "192.168.1.\u2022\u2022\u2022",
+    "lastSeen": "2 hours ago",
+    "current": false
+  }
+]

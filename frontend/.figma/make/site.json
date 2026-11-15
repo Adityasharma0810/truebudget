@@ -1,0 +1,10 @@
+{
+  "description": "A remote broadband control console for households to monitor device experience, prioritize calls and games, and understand network decisions with transparent QoE insights.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}

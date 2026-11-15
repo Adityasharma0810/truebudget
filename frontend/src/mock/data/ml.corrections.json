@@ -1,0 +1,10 @@
+[
+  {
+    "id": "cor1",
+    "flowId": "f32",
+    "device": "Living-room TV",
+    "from": "unknown",
+    "to": "game",
+    "status": "pending"
+  }
+]

@@ -1,0 +1,26 @@
+[
+  {
+    "id": "h1",
+    "title": "Evening upstream congestion",
+    "confidence": 0.88,
+    "signals": ["RTT increases under load", "Queue depth +18 packets", "No local packet loss"],
+    "recommendation": "Keep adaptive shaping enabled. Check the upstream rate at an off-peak time.",
+    "status": "recommendation"
+  },
+  {
+    "id": "h2",
+    "title": "Wi-Fi interference",
+    "confidence": 0.36,
+    "signals": ["Radio telemetry: unknown", "One device has elevated jitter"],
+    "recommendation": "Check router channel utilization. Radio telemetry is not available to the agent.",
+    "status": "unknown"
+  },
+  {
+    "id": "h3",
+    "title": "Physical link degradation",
+    "confidence": 0.12,
+    "signals": ["Carrier stable", "Loss below 0.1%"],
+    "recommendation": "No action needed. Continue observing.",
+    "status": "observing"
+  }
+]

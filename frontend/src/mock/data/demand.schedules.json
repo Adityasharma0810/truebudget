@@ -1,0 +1,20 @@
+[
+  {
+    "id": "s1",
+    "name": "Weekday work call",
+    "device": "Maya\u2019s laptop",
+    "time": "09:00",
+    "duration": "60 min",
+    "confidence": 0.92,
+    "enabled": true
+  },
+  {
+    "id": "s2",
+    "name": "Movie night",
+    "device": "Living-room TV",
+    "time": "20:00",
+    "duration": "120 min",
+    "confidence": 0.81,
+    "enabled": true
+  }
+]

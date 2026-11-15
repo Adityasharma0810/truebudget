@@ -1,0 +1,14 @@
+[
+  {
+    "id": "l1",
+    "ts": "2026-06-18T10:00:00Z",
+    "action": "INFO",
+    "detail": "Control loop healthy. Metadata-only classifier ready."
+  },
+  {
+    "id": "l2",
+    "ts": "2026-06-18T10:00:30Z",
+    "action": "INFO",
+    "detail": "Verifier accepted allocation; service floors preserved."
+  }
+]

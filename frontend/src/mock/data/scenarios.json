@@ -1,0 +1,32 @@
+[
+  {
+    "id": "iso-call",
+    "name": "ISO download during a call",
+    "description": "One big download. One important conversation. Keep them both moving.",
+    "icon": "download",
+    "baseline": 186,
+    "managed": 22,
+    "duration": "3 min",
+    "tag": "Everyday congestion"
+  },
+  {
+    "id": "wan-drop",
+    "name": "WAN drop: 100 \u2192 20 Mbps",
+    "description": "A sudden capacity drop tests how quickly your network can adapt.",
+    "icon": "signal",
+    "baseline": 248,
+    "managed": 28,
+    "duration": "3 min",
+    "tag": "Capacity shock"
+  },
+  {
+    "id": "three-tvs",
+    "name": "Three TVs + a gamer",
+    "description": "Movie night meets match point. Give every experience a fair share.",
+    "icon": "tv",
+    "baseline": 142,
+    "managed": 24,
+    "duration": "3 min",
+    "tag": "Competing demand"
+  }
+]
