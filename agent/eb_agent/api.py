@@ -25,8 +25,13 @@ from pydantic import BaseModel, ConfigDict, Field
 from eb_agent.config import AgentConfig
 from eb_agent.core import AgentCore, Snapshot, Tick
 from eb_agent.decision_log import DecisionLog, GENESIS_HASH
+from eb_agent.health import get_health_service
 from eb_agent.intents import IntentService
+from eb_agent.negotiation import get_negotiation_service
+from eb_agent.experiments import ExperimentStore, run_experiment
 from eb_agent.qoe_server import qoe_band
+from eb_agent.federated import get_federated_service
+from eb_agent.rag import get_ask_service
 from eb_agent.security import AgentIdentity, PairingManager, SessionManager, generate_identity, make_pairing_key, make_pairing_link
 from eb_agent.store import Store
 
@@ -285,6 +290,11 @@ def create_app(
     pairing: Optional[PairingManager] = None,
     sessions: Optional[SessionManager] = None,
     identity: Optional[AgentIdentity] = None,
+    health=None,
+    negotiation=None,
+    experiments=None,
+    federated=None,
+    ask_service=None,
 ) -> FastAPI:
     app = FastAPI(title="Experience Budget Agent", version=APP_VERSION)
     app.state.config = config
@@ -295,6 +305,11 @@ def create_app(
     app.state.pairing = pairing
     app.state.sessions = sessions
     app.state.identity = identity
+    app.state.health = health
+    app.state.negotiation = negotiation
+    app.state.experiments = experiments
+    app.state.federated = federated
+    app.state.ask = ask_service
     app.state._started = time.time()
 
     @app.middleware("http")
@@ -605,7 +620,303 @@ def create_app(
 
     @app.get("/api/v1/health/diagnosis")
     async def health_diagnosis():
-        return {"hypotheses": [], "signals": {}, "recommendations": []}
+        health = app.state.health
+        core: AgentCore = app.state.core
+        snap = core.last_snapshot
+        if health is None or snap is None:
+            return {
+                "hypotheses": [],
+                "signals": {},
+                "recommendations": [],
+            }
+        capacity = snap.capacity_mbps if snap else 100.0
+        qoe_data = snap.qoe if isinstance(snap.qoe, dict) else {}
+        household = qoe_data.get("household", {})
+        jitter = 3.0
+        loss_pct = 0.1
+        qoe_val = household if isinstance(household, (int, float)) else household.get("qoe") if isinstance(household, dict) else None
+        hypotheses = health.diagnose(
+            capacity_mbps=float(capacity or 100.0),
+            jitter_ms=jitter,
+            loss_pct=loss_pct,
+            qoe=qoe_val,
+        )
+        return {
+            "hypotheses": [
+                {
+                    "id": h.id,
+                    "title": h.title,
+                    "confidence": h.confidence,
+                    "signals": h.signals,
+                    "recommendation": h.recommendation,
+                    "status": h.status,
+                }
+                for h in hypotheses
+            ],
+            "signals": {},
+            "recommendations": [h.recommendation for h in hypotheses],
+        }
+
+    @app.get("/api/v1/conflicts")
+    async def conflicts():
+        negotiation = app.state.negotiation
+        core: AgentCore = app.state.core
+        snap = core.last_snapshot
+        capacity = snap.capacity_mbps if snap else 100.0
+        flows = snap.flows if snap else []
+        demands = {}
+        for f in flows:
+            did = f.get("device_id", "unknown")
+            demands[did] = demands.get(did, 0.0) + f.get("bytes_per_s", 0) / 1_000_000.0
+        conflicts = negotiation.detect_conflicts(demands, float(capacity))
+        return [
+            {
+                "id": c.id,
+                "title": c.title,
+                "description": c.description,
+                "status": c.status,
+                "options": [
+                    {
+                        "name": o.name,
+                        "description": o.description,
+                        "allocations": o.allocations,
+                    }
+                    for o in c.options
+                ],
+            }
+            for c in conflicts
+        ]
+
+    @app.post("/api/v1/conflicts/{conflict_id}/accept")
+    async def conflicts_accept(conflict_id: str):
+        negotiation = app.state.negotiation
+        conflict = negotiation.resolve(conflict_id, 0)
+        if not conflict:
+            raise HTTPException(status_code=404, detail={"code": "not_found", "message": "conflict not found or not pending"})
+        return {
+            "id": conflict.id,
+            "status": conflict.status,
+            "verdict": "accepted",
+        }
+
+    @app.post("/api/v1/conflicts/{conflict_id}/adjust")
+    async def conflicts_adjust(conflict_id: str, request: Request):
+        negotiation = app.state.negotiation
+        body = await request.json()
+        option_index = int(body.get("option", 1))
+        conflict = negotiation.resolve(conflict_id, option_index)
+        if not conflict:
+            raise HTTPException(status_code=404, detail={"code": "not_found", "message": "conflict not found or not pending"})
+        return {
+            "id": conflict.id,
+            "status": conflict.status,
+            "verdict": "adjusted",
+        }
+
+    @app.post("/api/v1/conflicts/{conflict_id}/cancel")
+    async def conflicts_cancel(conflict_id: str):
+        negotiation = app.state.negotiation
+        ok = negotiation.cancel(conflict_id)
+        return {"ok": ok}
+
+    @app.get("/api/v1/demand/schedules")
+    async def demand_schedules():
+        store: Store = app.state.store
+        rows = store.execute(
+            "SELECT schedule_id, name, device_id, time, duration, confidence, enabled "
+            "FROM demand_schedules ORDER BY created_at DESC"
+        ).fetchall()
+        return [
+            {
+                "id": r["schedule_id"],
+                "name": r["name"],
+                "device": r["device_id"],
+                "time": r["time"],
+                "duration": r["duration"],
+                "confidence": r["confidence"],
+                "enabled": bool(r["enabled"]),
+            }
+            for r in rows
+        ]
+
+    @app.post("/api/v1/demand/schedules")
+    async def demand_schedule_create(request: Request):
+        store: Store = app.state.store
+        body = await request.json()
+        schedule_id = f"sched-{uuid.uuid4().hex[:8]}"
+        store.execute(
+            "INSERT INTO demand_schedules(schedule_id, name, device_id, time, duration, "
+            "confidence, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                schedule_id,
+                body.get("name", "Untitled"),
+                body.get("device", ""),
+                body.get("time", "09:00"),
+                body.get("duration", "60 min"),
+                body.get("confidence", 0.8),
+                True,
+                time.time(),
+            ),
+        )
+        store.commit()
+        return {
+            "id": schedule_id,
+            "name": body.get("name", "Untitled"),
+            "device": body.get("device", ""),
+            "time": body.get("time", "09:00"),
+            "duration": body.get("duration", "60 min"),
+            "confidence": body.get("confidence", 0.8),
+            "enabled": True,
+        }
+
+    @app.delete("/api/v1/demand/schedules")
+    async def demand_schedule_delete(request: Request):
+        store: Store = app.state.store
+        schedule_id = request.query_params.get("id")
+        if not schedule_id:
+            raise HTTPException(status_code=400, detail={"code": "bad_request", "message": "missing id"})
+        store.execute("UPDATE demand_schedules SET enabled = 0 WHERE schedule_id = ?", (schedule_id,))
+        store.commit()
+        return {"ok": True, "id": schedule_id}
+
+    @app.post("/api/v1/scenarios/{scenario_id}")
+    async def scenarios_start(scenario_id: str, request: Request):
+        core: AgentCore = app.state.core
+        store: Store = app.state.store
+        body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+        # Record scenario as active in settings
+        scenario = {
+            "id": scenario_id,
+            "active": True,
+            "started_at": time.time(),
+            "emulated": True,
+        }
+        store.execute(
+            "INSERT OR REPLACE INTO settings(key, value, updated_at) VALUES (?, ?, ?)",
+            (f"scenario:{scenario_id}", json.dumps(scenario), time.time()),
+        )
+        store.commit()
+        return {"scenario_id": scenario_id, "active": True, "emulated": True}
+
+    @app.post("/api/v1/scenarios/stop")
+    async def scenarios_stop():
+        store: Store = app.state.store
+        store.execute(
+            "UPDATE settings SET value = json_set(value, '$.active', 0) "
+            "WHERE key LIKE 'scenario:%' AND json_extract(value, '$.active') = 1"
+        )
+        store.commit()
+        return {"verdict": "scenarios_stopped", "emulated": True}
+
+    @app.post("/api/v1/experiments")
+    async def experiments_start(request: Request):
+        experiments: ExperimentStore = app.state.experiments
+        body = await request.json()
+        exp = experiments.create(
+            scenario=body.get("scenario", "mixed_household"),
+            seed=int(body.get("seed", 4242)),
+            trials=int(body.get("trials", 20)),
+        )
+        run_experiment(experiments, exp)
+        return {
+            "id": exp.id,
+            "scenario": exp.scenario,
+            "seed": exp.seed,
+            "trials": exp.trials,
+            "progress": exp.progress,
+            "status": exp.status,
+            "emulated": True,
+        }
+
+    @app.get("/api/v1/experiments")
+    async def experiments_list():
+        experiments: ExperimentStore = app.state.experiments
+        return [
+            {
+                "id": e.id,
+                "scenario": e.scenario,
+                "seed": e.seed,
+                "trials": e.trials,
+                "progress": e.progress,
+                "status": e.status,
+                "results": [
+                    {
+                        "metric": r.metric,
+                        "unit": r.unit,
+                        "unmanaged": r.unmanaged,
+                        "cake": r.cake,
+                        "eb": r.eb,
+                        "ci": r.ci,
+                    }
+                    for r in e.results
+                ],
+                "emulated": True,
+            }
+            for e in experiments.list()
+        ]
+
+    @app.get("/api/v1/experiments/{exp_id}/report")
+    async def experiments_report(exp_id: str):
+        experiments: ExperimentStore = app.state.experiments
+        exp = experiments.get(exp_id)
+        if not exp:
+            raise HTTPException(status_code=404, detail={"code": "not_found", "message": "experiment not found"})
+        return {
+            "id": exp.id,
+            "scenario": exp.scenario,
+            "seed": exp.seed,
+            "trials": exp.trials,
+            "status": exp.status,
+            "results": [
+                {
+                    "metric": r.metric,
+                    "unit": r.unit,
+                    "unmanaged": r.unmanaged,
+                    "cake": r.cake,
+                    "eb": r.eb,
+                    "ci": r.ci,
+                }
+                for r in exp.results
+            ],
+            "emulated": True,
+        }
+
+    @app.get("/api/v1/federated/status")
+    async def federated_status():
+        federated = app.state.federated
+        s = federated.status()
+        return {
+            "enabled": s.enabled,
+            "rounds": s.rounds,
+            "lastAggregate": s.last_aggregate,
+            "participants": s.participants,
+            "emulated": True,
+        }
+
+    @app.post("/api/v1/federated/opt-in")
+    async def federated_opt_in():
+        federated = app.state.federated
+        s = federated.opt_in()
+        return {"enabled": s.enabled, "verdict": "opted_in", "emulated": True}
+
+    @app.post("/api/v1/federated/opt-out")
+    async def federated_opt_out():
+        federated = app.state.federated
+        s = federated.opt_out()
+        return {"enabled": s.enabled, "verdict": "opted_out", "emulated": True}
+
+    @app.post("/api/v1/ask")
+    async def ask(request: Request):
+        ask = app.state.ask
+        body = await request.json()
+        question = body.get("question", "")
+        answer = ask.answer(question)
+        return {
+            "text": answer.text,
+            "citations": answer.citations,
+            "disclaimer": answer.disclaimer,
+            "emulated": True,
+        }
 
     @app.get("/api/v1/links")
     async def links():
@@ -683,6 +994,11 @@ def run_server(
     pairing: Optional[PairingManager] = None,
     sessions: Optional[SessionManager] = None,
     identity: Optional[AgentIdentity] = None,
+    health=None,
+    negotiation=None,
+    experiments=None,
+    federated=None,
+    ask_service=None,
 ) -> None:
     """Create the FastAPI app, start the control loops, and serve uvicorn."""
 
@@ -695,6 +1011,11 @@ def run_server(
         pairing=pairing,
         sessions=sessions,
         identity=identity,
+        health=health,
+        negotiation=negotiation,
+        experiments=experiments,
+        federated=federated,
+        ask_service=ask_service,
     )
 
     @app.on_event("startup")
@@ -748,7 +1069,23 @@ if __name__ == "__main__":
         decision_log=decision_log,
         emulated=(config.mode == "lab" or config.mode == "monitor"),
     )
+    health = get_health_service()
+    negotiation = get_negotiation_service()
+    experiments = ExperimentStore()
+    federated = get_federated_service()
+    ask_service = get_ask_service()
     print(f"eb-agentd serving on http://{('0.0.0.0')}:{7443} (mode={config.mode})")
-    run_server(config, core, store, host="0.0.0.0", port=7443)
+    run_server(
+        config,
+        core,
+        store,
+        host="0.0.0.0",
+        port=7443,
+        health=health,
+        negotiation=negotiation,
+        experiments=experiments,
+        federated=federated,
+        ask_service=ask_service,
+    )
 
 

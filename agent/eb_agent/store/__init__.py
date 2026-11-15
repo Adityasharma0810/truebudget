@@ -280,6 +280,17 @@ CREATE INDEX IF NOT EXISTS idx_capacity_history_ts ON capacity_history(ts);
 CREATE INDEX IF NOT EXISTS idx_decisions_ts ON decisions(ts);
 CREATE INDEX IF NOT EXISTS idx_intents_expires ON intents(expires_at);
 CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts);
+
+CREATE TABLE IF NOT EXISTS demand_schedules (
+  schedule_id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  time TEXT NOT NULL,
+  duration TEXT NOT NULL,
+  confidence REAL NOT NULL DEFAULT 0.8,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at REAL NOT NULL
+);
 """
 
 MIGRATIONS: dict[int, str] = {1: SCHEMA_SQL}
