@@ -28,7 +28,9 @@ import {
   ErrorState,
 } from "../../components/ui";
 import { Topology } from "../../components/Topology";
-import { useApi, transport } from "../../lib/api";
+import { useApi, transport, setTransport } from "../../lib/api";
+import { DirectTransport } from "../../lib/transport/DirectTransport";
+import { RelayTransport } from "../../lib/transport/RelayTransport";
 import type { Capabilities, Snapshot } from "../../types";
 import { Reveal } from "../../motion/primitives";
 function PublicHeader() {
@@ -328,6 +330,12 @@ export function Connect() {
       setStage(1);
       await new Promise((r) => setTimeout(r, 400));
       setStage(2);
+      // Select the real transport based on the user's connection method.
+      if (choice === "direct") {
+        setTransport(new DirectTransport(undefined, host));
+      } else {
+        setTransport(new RelayTransport());
+      }
       await transport.connect(key);
       setStage(3);
       await new Promise((r) => setTimeout(r, 400));

@@ -1,0 +1,36 @@
+version: "3.8"
+
+services:
+  eb-relay:
+    image: python:3.11-slim
+    working_dir: /app
+    volumes:
+      - ./agent:/app/agent
+    command: >
+      sh -c "pip install --quiet -q fastapi uvicorn && 
+             python3 -m eb_agent.relay"
+    ports:
+      - "8765:8765"
+    environment:
+      - EB_RELAY_URL=ws://eb-relay:8765/ws
+
+  eb-agent:
+    build: .
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - eb-data:/var/lib/eb-agent
+      - eb-config:/etc/eb-agent
+      - /run:/run
+    environment:
+      - EB_MODE=gateway
+      - EB_ENFORCERD_SOCKET=/run/eb-enforcerd.sock
+      - EB_RELAY_URL=ws://eb-relay:8765/ws
+    depends_on:
+      - eb-relay
+    ports:
+      - "8080:8080"
+
+volumes:
+  eb-data:
+  eb-config:

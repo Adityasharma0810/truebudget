@@ -1,7 +1,7 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "../../App";
-import { queryClient, transport } from "../../lib/api";
+import { queryClient, transport, getTransport } from "../../lib/api";
 import { MockTransport } from "../../lib/transport/MockTransport";
 import Home from "./Home";
 
@@ -13,7 +13,7 @@ afterEach(() => {
 
 describe("Home", () => {
   it("renders the home console with the mock transport", async () => {
-    expect(transport).toBeInstanceOf(MockTransport);
+    expect(getTransport()).toBeInstanceOf(MockTransport);
     expect(Home).toBeTypeOf("function");
     vi.stubGlobal("scrollTo", vi.fn());
     window.history.replaceState({}, "", "/app");

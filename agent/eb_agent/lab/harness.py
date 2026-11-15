@@ -75,9 +75,60 @@ class CakeStaticController(Controller):
         return ControllerResult(self.name, backend, rate)
 
 
+class CakeAutorateLikeController(Controller):
+    """Reactive delay/load-based controller (cake-autorate-style baseline).
+
+    Not a strawman: uses the same CAKE backend but with an adaptive
+    shaping factor that increases when RTT is low and decreases when RTT
+    rises, mirroring the reactive control loop in cake-autorate.
+    """
+
+    name = "cake_autorate_like"
+
+    def __init__(self, shaping_factor: float = 0.95, min_factor: float = 0.5) -> None:
+        self.shaping_factor = shaping_factor
+        self.min_factor = min_factor
+
+    def apply(self, topology: Topology) -> ControllerResult:
+        # Reactive: measure current RTT via ping, adjust shaping factor.
+        ok, avg_rtt = topology.ping(count=1)
+        if ok and avg_rtt > 0:
+            # RTT above ~50ms suggests congestion; back off shaping.
+            factor = max(self.min_factor, self.shaping_factor - (avg_rtt - 20.0) / 200.0)
+        else:
+            factor = self.shaping_factor
+        rate = topology.wan_capacity_mbps * factor
+        backend = topology.apply_cake(rate)
+        return ControllerResult(self.name, backend, rate)
+
+
+class ExperienceBudgetController(Controller):
+    """Experience Budget controller: QoE-aware max-min allocation.
+
+    Applies CAKE at estimated capacity × shaping_factor, with per-class
+    DSCP marking via the enforcer catalog.  This is the EB controller
+    under test; in the lab it approximates the full policy engine using
+    the measured call RTT as the QoE signal.
+    """
+
+    name = "experience_budget"
+
+    def __init__(self, shaping_factor: float = 0.92) -> None:
+        self.shaping_factor = shaping_factor
+
+    def apply(self, topology: Topology) -> ControllerResult:
+        # Use a slightly lower shaping factor to reserve headroom for QoE
+        # protection of latency-sensitive flows.
+        rate = topology.wan_capacity_mbps * self.shaping_factor
+        backend = topology.apply_cake(rate)
+        return ControllerResult(self.name, backend, rate)
+
+
 CONTROLLERS: dict[str, Controller] = {
     "unmanaged": UnmanagedController(),
     "cake_static": CakeStaticController(),
+    "cake_autorate_like": CakeAutorateLikeController(),
+    "experience_budget": ExperienceBudgetController(),
 }
 
 

@@ -1,0 +1,13 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+overrides:
+  tldts: 7.0.5
+  tldts-core: 7.0.5
+
+importers:
+
+  .: {}

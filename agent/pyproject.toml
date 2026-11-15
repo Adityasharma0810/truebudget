@@ -12,6 +12,13 @@ dependencies = []
 [project.optional-dependencies]
 dev = [
   "pytest>=8.3",
+  "pytest-asyncio>=1.0",
+  "fastapi>=0.100",
+  "uvicorn>=0.20",
+  "httpx>=0.24",
+  "cryptography>=45",
+  "scikit-learn>=1.0",
+  "statsmodels>=0.14",
 ]
 
 [tool.setuptools.packages.find]
@@ -22,5 +29,7 @@ include = ["eb_agent*"]
 testpaths = ["tests"]
 markers = [
   "netns: requires a Linux network namespace with CAP_NET_ADMIN (run under unshare -Urn)",
+  "asyncio: async test",
 ]
 addopts = "-ra"
+asyncio_mode = "auto"

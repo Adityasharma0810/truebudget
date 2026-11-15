@@ -4,6 +4,7 @@ import { z } from "zod";
 import { MockTransport } from "../transport/MockTransport";
 import { RelayTransport } from "../transport/RelayTransport";
 import { DirectTransport } from "../transport/DirectTransport";
+import type { Transport } from "../transport/Transport";
 import {
   SnapshotSchema,
   IntentSchema,
@@ -16,12 +17,23 @@ export const queryClient = new QueryClient({
   defaultOptions: { queries: { retry: 1, staleTime: 1500, refetchOnWindowFocus: false } },
 });
 const mode = import.meta.env?.VITE_TRANSPORT ?? "mock";
-export const transport =
+let currentTransport: Transport =
   mode === "relay"
     ? new RelayTransport()
     : mode === "direct"
       ? new DirectTransport()
       : new MockTransport();
+export function setTransport(t: Transport) {
+  currentTransport = t;
+}
+export function getTransport(): Transport {
+  return currentTransport;
+}
+export const transport = new Proxy({} as Transport, {
+  get(_target, prop) {
+    return (currentTransport as any)[prop];
+  },
+});
 const schemas: Record<string, z.ZodType> = {
   "/state/snapshot": SnapshotSchema,
   "/intents": z.array(IntentSchema),
@@ -53,7 +65,7 @@ export function useSnapshot() {
   const query = useApi<Snapshot>("/state/snapshot", { refetchInterval: 3000 });
   useEffect(
     () =>
-      transport.subscribe("snapshot", (value) => client.setQueryData(["/state/snapshot"], value)),
+      transport.subscribe("snapshot", (value: unknown) => client.setQueryData(["/state/snapshot"], value)),
     [client],
   );
   return query;
