@@ -1,0 +1,210 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Experience Budget Agent API",
+    "version": "1.0.0",
+    "description": "JSON is a valid YAML 1.2 subset so the contract can be checked with Node built-ins."
+  },
+  "servers": [{ "url": "/api/v1" }],
+  "x-rate-limit-response": { "status": 429, "$ref": "#/components/responses/RateLimited" },
+  "paths": {
+    "/capabilities": { "get": { "operationId": "getCapabilities", "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/state/snapshot": { "get": { "operationId": "getSnapshot", "responses": { "200": { "$ref": "#/components/responses/Snapshot" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/stream": { "description": "WebSocket stream; events are snapshot, tick, decision, intent, mode, alert, and scenario.", "x-websocket-events": ["snapshot", "tick", "decision", "intent", "mode", "alert", "scenario"] },
+    "/metrics": { "get": { "operationId": "getMetrics", "parameters": [{ "$ref": "#/components/parameters/Page" }, { "$ref": "#/components/parameters/PageSize" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/devices": {
+      "get": { "operationId": "listDevices", "parameters": [{ "$ref": "#/components/parameters/Page" }, { "$ref": "#/components/parameters/PageSize" }], "responses": { "200": { "$ref": "#/components/responses/Devices" }, "default": { "$ref": "#/components/responses/Error" } } },
+      "patch": { "operationId": "updateDevices", "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }], "responses": { "200": { "$ref": "#/components/responses/Devices" }, "default": { "$ref": "#/components/responses/Error" } } }
+    },
+    "/flows": { "get": { "operationId": "listFlows", "parameters": [{ "$ref": "#/components/parameters/Page" }, { "$ref": "#/components/parameters/PageSize" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/flows/{id}/correct": { "post": { "operationId": "correctFlow", "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/intents": {
+      "get": { "operationId": "listIntents", "parameters": [{ "$ref": "#/components/parameters/Page" }, { "$ref": "#/components/parameters/PageSize" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } },
+      "post": { "operationId": "createIntent", "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } },
+      "delete": { "operationId": "cancelIntent", "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } }
+    },
+    "/intents/{id}": { "delete": { "operationId": "deleteIntent", "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/conflicts": { "get": { "operationId": "listConflicts", "parameters": [{ "$ref": "#/components/parameters/Page" }, { "$ref": "#/components/parameters/PageSize" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/conflicts/{id}/accept": { "post": { "operationId": "acceptConflict", "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/conflicts/{id}/adjust": { "post": { "operationId": "adjustConflict", "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/conflicts/{id}/cancel": { "post": { "operationId": "cancelConflict", "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/decisions": { "get": { "operationId": "listDecisions", "parameters": [{ "$ref": "#/components/parameters/Page" }, { "$ref": "#/components/parameters/PageSize" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/decisions/verify": { "get": { "operationId": "verifyDecisionChain", "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/health/diagnosis": { "get": { "operationId": "getDiagnosis", "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/demand/schedules": {
+      "get": { "operationId": "listSchedules", "parameters": [{ "$ref": "#/components/parameters/Page" }, { "$ref": "#/components/parameters/PageSize" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } },
+      "post": { "operationId": "createSchedule", "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } },
+      "delete": { "operationId": "deleteSchedule", "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } }
+    },
+    "/demand/forecast": { "get": { "operationId": "getDemandForecast", "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/links": { "get": { "operationId": "listLinks", "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/paths/evaluate": { "post": { "operationId": "evaluatePaths", "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/scenarios/{name}": { "post": { "operationId": "startScenario", "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/scenarios/stop": { "post": { "operationId": "stopScenario", "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/experiments": {
+      "get": { "operationId": "listExperiments", "parameters": [{ "$ref": "#/components/parameters/Page" }, { "$ref": "#/components/parameters/PageSize" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } },
+      "post": { "operationId": "createExperiment", "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } }
+    },
+    "/experiments/{id}": { "get": { "operationId": "getExperiment", "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/experiments/{id}/report": { "get": { "operationId": "getExperimentReport", "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/settings": {
+      "get": { "operationId": "getSettings", "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } },
+      "put": { "operationId": "updateSettings", "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } }
+    },
+    "/safe-state/reset": { "post": { "operationId": "resetSafeState", "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/ml/metrics": { "get": { "operationId": "getModelMetrics", "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/ml/corrections": {
+      "get": { "operationId": "listCorrections", "parameters": [{ "$ref": "#/components/parameters/Page" }, { "$ref": "#/components/parameters/PageSize" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } },
+      "post": { "operationId": "reviewCorrection", "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } }
+    },
+    "/ml/retrain": { "post": { "operationId": "retrainModel", "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/ml/rollback": { "post": { "operationId": "rollbackModel", "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/qoe/formulas": { "get": { "operationId": "getQoeFormulas", "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/ask": { "post": { "operationId": "askRouter", "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/models/updates": {
+      "get": { "operationId": "getModelUpdates", "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } },
+      "post": { "operationId": "submitModelUpdate", "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } }
+    },
+    "/agent/info": { "get": { "operationId": "getAgentInfo", "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/agent/logs": { "get": { "operationId": "getAgentLogs", "parameters": [{ "$ref": "#/components/parameters/Page" }, { "$ref": "#/components/parameters/PageSize" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/agent/update-check": { "post": { "operationId": "checkAgentUpdate", "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/sessions": {
+      "get": { "operationId": "listSessions", "parameters": [{ "$ref": "#/components/parameters/Page" }, { "$ref": "#/components/parameters/PageSize" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } },
+      "delete": { "operationId": "revokeSession", "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } }
+    },
+    "/keys/rotate": { "post": { "operationId": "rotateKeys", "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/audit": { "get": { "operationId": "getAuditLog", "parameters": [{ "$ref": "#/components/parameters/Page" }, { "$ref": "#/components/parameters/PageSize" }], "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } },
+    "/metrics/internal": { "get": { "operationId": "getInternalMetrics", "x-local-only": true, "responses": { "200": { "$ref": "#/components/responses/Ok" }, "default": { "$ref": "#/components/responses/Error" } } } }
+  },
+  "components": {
+    "parameters": {
+      "IdempotencyKey": { "name": "Idempotency-Key", "in": "header", "required": true, "schema": { "type": "string" } },
+      "Page": { "name": "page", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
+      "PageSize": { "name": "pageSize", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200 } }
+    },
+    "responses": {
+      "Ok": { "description": "Successful response." },
+      "RateLimited": { "description": "Request rate limit exceeded.", "headers": { "Retry-After": { "description": "Seconds until another request may be made.", "schema": { "type": "integer" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "Snapshot": { "description": "Current agent snapshot.", "headers": { "ETag": { "schema": { "type": "string" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Snapshot" } } } },
+      "Devices": { "description": "Device inventory.", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/Device" } } } } },
+      "Error": { "description": "Consistent API error.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+    },
+    "schemas": {
+      "TrafficClass": { "type": "string", "enum": ["call", "game", "stream", "bulk", "unknown"] },
+      "QoEBand": { "type": "string", "enum": ["green", "amber", "red", "idle"] },
+      "Mode": { "type": "string", "enum": ["adaptive", "reactive_fallback", "safe_state"] },
+      "FeatureMap": { "type": "object", "additionalProperties": { "type": "number" } },
+      "Flow": {
+        "type": "object", "required": ["id", "cls", "confidence", "qoe", "band", "throughputMbps", "features"],
+        "properties": {
+          "id": { "type": "string" }, "cls": { "$ref": "#/components/schemas/TrafficClass" }, "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+          "qoe": { "type": ["number", "null"] }, "band": { "$ref": "#/components/schemas/QoEBand" }, "throughputMbps": { "type": "number" },
+          "features": { "$ref": "#/components/schemas/FeatureMap" }, "baselineCls": { "$ref": "#/components/schemas/TrafficClass" }
+        }
+      },
+      "Device": {
+        "type": "object", "required": ["id", "name", "qoe", "band", "flows"],
+        "properties": {
+          "id": { "type": "string" }, "name": { "type": "string" }, "person": { "type": "string" }, "type": { "type": "string" },
+          "ip": { "type": "string" }, "qoe": { "type": ["number", "null"] }, "band": { "$ref": "#/components/schemas/QoEBand" },
+          "flows": { "type": "array", "items": { "$ref": "#/components/schemas/Flow" } }
+        }
+      },
+      "Forecast": { "type": "object", "required": ["ts", "mbps", "lo", "hi"], "properties": { "ts": { "type": "string" }, "mbps": { "type": "number" }, "lo": { "type": "number" }, "hi": { "type": "number" } } },
+      "Alert": { "type": "object", "required": ["id", "message", "severity"], "properties": { "id": { "type": "string" }, "message": { "type": "string" }, "severity": { "type": "string", "enum": ["info", "warning", "error"] } } },
+      "Snapshot": {
+        "type": "object", "required": ["agent", "ts", "mode", "link", "household", "devices", "metrics", "alerts", "scenario", "tick", "connected"],
+        "properties": {
+          "agent": { "type": "object", "required": ["id", "name", "version", "intervalSeconds", "capabilities", "emulated", "seed"], "properties": {
+            "id": { "type": "string" }, "name": { "type": "string" }, "version": { "type": "string" }, "intervalSeconds": { "type": "number" },
+            "capabilities": { "type": "array", "items": { "type": "string" } }, "emulated": { "type": "boolean" }, "seed": { "type": "number" }
+          } },
+          "ts": { "type": "string" }, "mode": { "$ref": "#/components/schemas/Mode" },
+          "link": { "type": "object", "required": ["capacityMbps", "uncertaintyMbps", "forecast", "forecastConfidence"], "properties": {
+            "capacityMbps": { "type": "number" }, "uncertaintyMbps": { "type": "number" }, "forecast": { "type": "array", "items": { "$ref": "#/components/schemas/Forecast" } }, "forecastConfidence": { "type": "number" }
+          } },
+          "household": { "type": "object", "required": ["qoe", "fairness", "worstDeviceId"], "properties": {
+            "qoe": { "type": "number" }, "fairness": { "type": "number" }, "worstDeviceId": { "type": ["string", "null"] }
+          } },
+          "devices": { "type": "array", "items": { "$ref": "#/components/schemas/Device" } },
+          "metrics": { "type": "object", "required": ["latencyMs", "jitterMs", "lossPct", "throughputMbps", "queueDepthPkts"], "properties": {
+            "latencyMs": { "type": "number" }, "jitterMs": { "type": "number" }, "lossPct": { "type": "number" }, "throughputMbps": { "type": "number" }, "queueDepthPkts": { "type": "number" }
+          } },
+          "alerts": { "type": "array", "items": { "$ref": "#/components/schemas/Alert" } }, "scenario": { "type": ["string", "null"] }, "tick": { "type": "integer" }, "connected": { "type": "boolean" }
+        }
+      },
+      "IntentInput": { "type": "object", "required": ["target", "goal", "priority", "durationSeconds", "allowedTradeoffs", "minServiceFloor"], "properties": {
+        "target": { "type": "object", "required": ["deviceId", "cls"], "properties": { "deviceId": { "type": "string" }, "cls": { "$ref": "#/components/schemas/TrafficClass" } } },
+        "goal": { "type": "string", "minLength": 3 }, "priority": { "type": "string", "enum": ["low", "normal", "high"] }, "durationSeconds": { "type": "number", "minimum": 60, "maximum": 86400 },
+        "deadline": { "type": ["string", "null"] }, "allowedTradeoffs": { "type": "array", "items": { "type": "string" } }, "minServiceFloor": { "const": true }
+      } },
+      "Intent": { "type": "object", "required": ["target", "goal", "priority", "durationSeconds", "allowedTradeoffs", "minServiceFloor", "id", "expiresAt", "status"], "properties": {
+        "target": { "type": "object", "required": ["deviceId", "cls"], "properties": { "deviceId": { "type": "string" }, "cls": { "$ref": "#/components/schemas/TrafficClass" } } },
+        "goal": { "type": "string", "minLength": 3 }, "priority": { "type": "string", "enum": ["low", "normal", "high"] }, "durationSeconds": { "type": "number", "minimum": 60, "maximum": 86400 },
+        "deadline": { "type": ["string", "null"] }, "allowedTradeoffs": { "type": "array", "items": { "type": "string" } }, "minServiceFloor": { "const": true },
+        "id": { "type": "string" }, "expiresAt": { "type": "string" }, "status": { "type": "string", "enum": ["pending", "active", "expired", "cancelled", "infeasible"] }
+      } },
+      "Decision": { "type": "object", "required": ["id", "ts", "trigger", "reason", "before", "after", "verdict", "evidence", "hash", "prevHash"], "properties": {
+        "id": { "type": "string" }, "ts": { "type": "string" }, "trigger": { "type": "string" }, "reason": { "type": "string" },
+        "before": { "type": "object", "additionalProperties": { "type": "number" } }, "after": { "type": "object", "additionalProperties": { "type": "number" } },
+        "verdict": { "type": "string", "enum": ["kept", "rolled_back", "escalated"] }, "evidence": {}, "hash": { "type": "string" }, "prevHash": { "type": "string" }
+      } },
+      "Settings": { "type": "object", "required": ["floorMbps", "rateChangePct", "dwellSeconds", "forecastThreshold", "classifierThreshold", "intervalSeconds", "retentionDays", "federated", "demandLearning", "flags"], "properties": {
+        "floorMbps": { "type": "number", "minimum": 1, "maximum": 20 }, "rateChangePct": { "type": "number", "minimum": 1, "maximum": 50 }, "dwellSeconds": { "type": "number", "minimum": 10, "maximum": 300 },
+        "forecastThreshold": { "type": "number", "minimum": 0.5, "maximum": 1 }, "classifierThreshold": { "type": "number", "minimum": 0.5, "maximum": 1 },
+        "intervalSeconds": { "type": "number", "minimum": 5, "maximum": 120 }, "retentionDays": { "type": "number", "minimum": 1, "maximum": 365 },
+        "federated": { "type": "boolean" }, "demandLearning": { "type": "boolean" }, "flags": { "type": "object", "additionalProperties": { "type": "boolean" } }
+      } },
+      "Error": { "type": "object", "required": ["code", "message"], "properties": { "code": { "type": "string" }, "message": { "type": "string" }, "details": {} } },
+      "MetricPoint": { "type": "object", "required": ["ts", "capacity", "lo", "hi", "throughput", "latency", "baseline", "jitter", "loss", "queue", "fairness"], "properties": {
+        "ts": { "type": "string" }, "capacity": { "type": "number" }, "lo": { "type": "number" }, "hi": { "type": "number" }, "throughput": { "type": "number" }, "latency": { "type": "number" }, "baseline": { "type": "number" }, "jitter": { "type": "number" }, "loss": { "type": "number" }, "queue": { "type": "number" }, "fairness": { "type": "number" }
+      } },
+      "Scenario": { "type": "object", "required": ["id", "name", "description", "icon", "baseline", "managed", "duration", "tag"], "properties": {
+        "id": { "type": "string" }, "name": { "type": "string" }, "description": { "type": "string" }, "icon": { "type": "string" }, "baseline": { "type": "number" }, "managed": { "type": "number" }, "duration": { "type": "string" }, "tag": { "type": "string" }
+      } },
+      "Policy": { "type": "object", "required": ["floorMbps", "allocations"], "properties": { "floorMbps": { "type": "number" }, "allocations": { "type": "object", "additionalProperties": { "type": "number" } } } },
+      "Link": { "type": "object", "required": ["id", "name", "type", "rtt", "loss", "capacity", "throughput", "state"], "properties": {
+        "id": { "type": "string" }, "name": { "type": "string" }, "type": { "type": "string" }, "rtt": { "type": "number" }, "loss": { "type": "number" }, "capacity": { "type": "number" }, "throughput": { "type": "number" }, "state": { "type": "string" }
+      } },
+      "Diagnosis": { "type": "object", "required": ["id", "title", "confidence", "signals", "recommendation", "status"], "properties": {
+        "id": { "type": "string" }, "title": { "type": "string" }, "confidence": { "type": "number" }, "signals": { "type": "array", "items": { "type": "string" } }, "recommendation": { "type": "string" }, "status": { "type": "string" }
+      } },
+      "Conflict": { "type": "object", "required": ["id", "title", "description", "status", "options"], "properties": {
+        "id": { "type": "string" }, "title": { "type": "string" }, "description": { "type": "string" }, "status": { "type": "string" },
+        "options": { "type": "array", "items": { "type": "object", "required": ["name", "description", "allocations"], "properties": { "name": { "type": "string" }, "description": { "type": "string" }, "allocations": { "type": "array", "items": { "type": "number" } } } } }
+      } },
+      "Schedule": { "type": "object", "required": ["id", "name", "device", "time", "duration", "confidence", "enabled"], "properties": {
+        "id": { "type": "string" }, "name": { "type": "string" }, "device": { "type": "string" }, "time": { "type": "string" }, "duration": { "type": "string" }, "confidence": { "type": "number" }, "enabled": { "type": "boolean" }
+      } },
+      "Experiment": { "type": "object", "required": ["id", "scenario", "seed", "trials", "progress", "status", "results"], "properties": {
+        "id": { "type": "string" }, "scenario": { "type": "string" }, "seed": { "type": "number" }, "trials": { "type": "number" }, "progress": { "type": "number" }, "status": { "type": "string" },
+        "results": { "type": "array", "items": { "type": "object", "required": ["metric", "unit", "unmanaged", "cake", "eb", "ci"], "properties": { "metric": { "type": "string" }, "unit": { "type": "string" }, "unmanaged": { "type": "number" }, "cake": { "type": "number" }, "eb": { "type": "number" }, "ci": { "type": "number" } } } }
+      } },
+      "Capabilities": { "type": "object", "required": ["flags", "classes", "scenarios", "formulas", "seed"], "properties": {
+        "flags": { "type": "object", "additionalProperties": { "type": "boolean" } }, "classes": { "type": "array", "items": { "$ref": "#/components/schemas/TrafficClass" } },
+        "scenarios": { "type": "array", "items": { "$ref": "#/components/schemas/Scenario" } }, "formulas": { "type": "object", "additionalProperties": { "type": "string" } }, "seed": { "type": "number" }
+      } },
+      "Correction": { "type": "object", "required": ["id", "flowId", "device", "from", "to", "status"], "properties": {
+        "id": { "type": "string" }, "flowId": { "type": "string" }, "device": { "type": "string" }, "from": { "type": "string" }, "to": { "type": "string" }, "status": { "type": "string" }
+      } },
+      "MLData": { "type": "object", "required": ["accuracy", "f1", "baseline", "encrypted", "matrix", "labels", "models", "corrections"], "properties": {
+        "accuracy": { "type": "number" }, "f1": { "type": "number" }, "baseline": { "type": "number" }, "encrypted": { "type": "number" },
+        "matrix": { "type": "array", "items": { "type": "array", "items": { "type": "number" } } }, "labels": { "type": "array", "items": { "type": "string" } },
+        "models": { "type": "array", "items": { "type": "object", "required": ["version", "status", "accuracy", "date"], "properties": { "version": { "type": "string" }, "status": { "type": "string" }, "accuracy": { "type": "number" }, "date": { "type": "string" } } } },
+        "corrections": { "type": "array", "items": { "$ref": "#/components/schemas/Correction" } }
+      } },
+      "AgentInfo": { "type": "object", "required": ["hostname", "os", "version", "uptime", "dbSize", "relay", "loopMs", "seed", "emulated"], "properties": {
+        "hostname": { "type": "string" }, "os": { "type": "string" }, "version": { "type": "string" }, "uptime": { "type": "string" }, "dbSize": { "type": "string" }, "relay": { "type": "string" }, "loopMs": { "type": "number" }, "seed": { "type": "number" }, "emulated": { "type": "boolean" }
+      } },
+      "Session": { "type": "object", "required": ["id", "name", "location", "lastSeen", "current"], "properties": {
+        "id": { "type": "string" }, "name": { "type": "string" }, "location": { "type": "string" }, "lastSeen": { "type": "string" }, "current": { "type": "boolean" }
+      } },
+      "LogEntry": { "type": "object", "required": ["id", "ts", "action", "detail"], "properties": {
+        "id": { "type": "string" }, "ts": { "type": "string" }, "action": { "type": "string" }, "detail": { "type": "string" }
+      } },
+      "AskAnswer": { "type": "object", "required": ["text", "citations", "disclaimer"], "properties": {
+        "text": { "type": "string" }, "citations": { "type": "array", "items": { "type": "string" } }, "disclaimer": { "type": "string" }
+      } }
+    }
+  }
+}

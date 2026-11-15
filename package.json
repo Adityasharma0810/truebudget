@@ -1,0 +1,12 @@
+{
+  "name": "experience-budget",
+  "private": true,
+  "packageManager": "pnpm@12.18.0",
+  "scripts": {
+    "build": "pnpm --filter figma-make-app build",
+    "lint": "pnpm --filter figma-make-app lint",
+    "typecheck": "pnpm --filter figma-make-app typecheck",
+    "test": "pnpm --filter figma-make-app test",
+    "contracts": "node packages/contracts/scripts/drift-check.mjs"
+  }
+}

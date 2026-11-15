@@ -4,6 +4,10 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+overrides:
+  tldts: 7.0.5
+  tldts-core: 7.0.5
+
 importers:
 
   .:
@@ -1635,11 +1639,11 @@ packages:
     resolution: {integrity: sha512-jBrmx4lYmaC9k/mgPbylxs7kBUxHtD8256up+HjLaDFfXScKJQyil+SWXSvhAtT7XHo+yTVlpB81PGmHP8oLSQ==}
     engines: {node: ^20.0.0 || >=22.0.0}
 
-  tldts-core@7.5.3:
-    resolution: {integrity: sha512-G9K/M0Ah+U22clAb1r0fYNheSysv7Y6OAIundzKcFQx5jBgPId3CnFl44sAGGqJA+lUXMOrREFXHX1lrtEApdA==}
+  tldts-core@7.0.5:
+    resolution: {integrity: sha512-o+2zicH2+bzj5PHV5M4U8OsRBJDOO0zADiTKZQTGdHSymGQYS21+V/YNrMxAxH9SopzMEXt5JuiRoOIZT5ZU9g==}
 
-  tldts@7.5.3:
-    resolution: {integrity: sha512-Gt09nFFdNq5+Gm7qubL33O+g1UZ6lAlV3QXUTbXpqYWS+OI58IqzuxUrwk/D6S6jLNvEZrHaBtXIGMh1mW1poA==}
+  tldts@7.0.5:
+    resolution: {integrity: sha512-Wjn3ZQIBZd3i94Gcw1hTD+BLgrkfeU71PDw7y7QxcUDCfhM5HdlZfNDbSerP4pj+ZbujKvRrlOYNRyRmQCHo0A==}
     hasBin: true
 
   tough-cookie@6.1.0:
@@ -3207,15 +3211,15 @@ snapshots:
 
   tinypool@2.2.0: {}
 
-  tldts-core@7.5.3: {}
+  tldts-core@7.0.5: {}
 
-  tldts@7.5.3:
+  tldts@7.0.5:
     dependencies:
-      tldts-core: 7.5.3
+      tldts-core: 7.0.5
 
   tough-cookie@6.1.0:
     dependencies:
-      tldts: 7.5.3
+      tldts: 7.0.5
 
   tr46@7.0.0:
     dependencies:

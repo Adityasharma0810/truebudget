@@ -30,6 +30,7 @@ react(),
     resolve: {
       alias: {
         '@': path.resolve(__dirname, './src'),
+        '@eb/contracts': path.resolve(__dirname, '../packages/contracts/src'),
       },
     },
     server: {

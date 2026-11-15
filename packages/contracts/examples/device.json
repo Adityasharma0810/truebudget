@@ -1,0 +1,24 @@
+{
+  "id": "device-1",
+  "name": "Work laptop",
+  "person": "Alex",
+  "type": "laptop",
+  "ip": "192.168.1.20",
+  "qoe": 0.91,
+  "band": "green",
+  "flows": [
+    {
+      "id": "flow-call-1",
+      "cls": "call",
+      "confidence": 0.94,
+      "qoe": 0.91,
+      "band": "green",
+      "throughputMbps": 2.4,
+      "features": {
+        "rtt": 24,
+        "jitter": 3.2,
+        "loss": 0.1
+      }
+    }
+  ]
+}

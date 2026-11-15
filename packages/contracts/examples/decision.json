@@ -1,0 +1,12 @@
+{
+  "id": "decision-1",
+  "ts": "2026-11-15T10:00:00Z",
+  "trigger": "call-latency",
+  "reason": "Reduced bulk traffic while protecting the active call.",
+  "before": { "device-1": 0.68 },
+  "after": { "device-1": 0.86 },
+  "verdict": "kept",
+  "evidence": { "emulated": true },
+  "hash": "sha256:example",
+  "prevHash": "GENESIS"
+}

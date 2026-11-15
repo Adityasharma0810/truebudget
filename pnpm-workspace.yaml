@@ -1,0 +1,12 @@
+packages:
+  - frontend
+  - packages/*
+  - cli
+
+# Preserve the Figma app's package-local lockfile while the monorepo grows.
+sharedWorkspaceLockfile: false
+
+# tough-cookie accepts ^7.0.5; avoid newly published transitive releases.
+overrides:
+  tldts: 7.0.5
+  tldts-core: 7.0.5

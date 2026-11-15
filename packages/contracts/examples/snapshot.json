@@ -1,0 +1,36 @@
+{
+  "agent": {
+    "id": "agent-demo",
+    "name": "Demo agent",
+    "version": "0.1.0",
+    "intervalSeconds": 30,
+    "capabilities": ["mock", "qoe-proxy"],
+    "emulated": true,
+    "seed": 4242
+  },
+  "ts": "2026-11-15T10:00:00Z",
+  "mode": "adaptive",
+  "link": {
+    "capacityMbps": 100,
+    "uncertaintyMbps": 5,
+    "forecast": [],
+    "forecastConfidence": 0.7
+  },
+  "household": {
+    "qoe": 0.86,
+    "fairness": 0.94,
+    "worstDeviceId": "device-1"
+  },
+  "devices": [],
+  "metrics": {
+    "latencyMs": 24,
+    "jitterMs": 3.2,
+    "lossPct": 0.1,
+    "throughputMbps": 38,
+    "queueDepthPkts": 12
+  },
+  "alerts": [],
+  "scenario": null,
+  "tick": 1,
+  "connected": true
+}

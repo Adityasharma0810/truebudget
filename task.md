@@ -4,8 +4,8 @@
 |---|---|
 | **Project** | Experience Budget (EB) — intent-aware adaptive QoS/QoE controller for home broadband |
 | **Version of this plan** | 1.0 (2026-11-15) |
-| **Status** | ACTIVE — master tracker. Work top-to-bottom; commit per phase; keep the repo runnable after every phase. |
-| **Working dir** | `E:\experience budget` |
+| **Status** | ACTIVE — Phase 0 groundwork in progress; G0 has not passed. Work top-to-bottom and keep the repo runnable after every phase. |
+| **Working dir** | `/home/vboxuser/Desktop/truebudget` (Linux) |
 | **Rule** | Never claim a feature is done unless it has a passing test or a reproducible demo command. |
 
 **How to use this file:** Phase 0 → Phase 10 in order. Each phase has: Goal, Work items (checkboxes), Tests, Gate (G#), Demo command, Commit message. Tick boxes as work completes. Sections 6–19 are the permanent reference specs the phases implement against.
@@ -133,13 +133,13 @@ experience-budget/
 ### Phase 0 — Audit, baseline, contracts, monorepo skeleton
 **Goal:** trustworthy baseline; single source of contract truth; repo under version control.
 
-- [ ] `git init`; `.gitignore` (node_modules, dist, __pycache__, .venv, *.db, reports/, .figma artifacts as needed); commit untouched frontend as-is.
-- [ ] Baseline run: `pnpm install`; `dev`, `build`, `tsc --noEmit`, `eslint .`; record results; fix what is broken **before** building on it.
-- [ ] Add scripts: `lint`, `typecheck`, `test` (vitest); smoke test rendering Home with MockTransport.
-- [ ] **Deep UI audit** → rewrite `frontend/docs/AUDIT.md` (mirrored to `docs/AUDIT.md`): table of 15 console pages + 4 public pages with `done | partial | missing` + file paths; current data contract (Snapshot, Device, Flow, Intent, Decision, Settings, endpoints) incl. mismatches vs §8; **per-component wiring audit** (controls that call Transport vs fake); env vars; prioritised TODO (§16).
-- [ ] Create `packages/contracts/`: `openapi.yaml` (all §8 endpoints, camelCase, error schema `{code,message,details}`), `examples/*.json`, `scripts/drift-check.mjs` (OpenAPI ↔ zod ↔ examples).
-- [ ] Frontend alias `@eb/contracts` → `../packages/contracts/src` (tsconfig + vite resolve.alias); smoke-test build.
-- [ ] Root `README.md` (roadmap stub), `Makefile` (test/lint/build), `pnpm-workspace.yaml`.
+- [x] Git repository and baseline frontend commits already exist; add root `.gitignore` for node_modules, dist, `__pycache__`, `.venv`, databases, reports, and generated outputs without ignoring Figma source.
+- [x] Baseline run: `pnpm install`; `dev`, `build`, `tsc --noEmit`, `eslint .`; record results; fix what is broken **before** building on it.
+- [x] Add scripts: `lint`, `typecheck`, `test` (vitest); smoke test rendering Home with MockTransport.
+- [x] **Deep UI audit** → rewrite `frontend/docs/AUDIT.md` (mirrored to `docs/AUDIT.md`): table of 15 console pages + 4 public pages with `done | partial | missing` + file paths; current data contract (Snapshot, Device, Flow, Intent, Decision, Settings, endpoints) incl. mismatches vs §8; **per-component wiring audit** (controls that call Transport vs fake); env vars; prioritised TODO (§16).
+- [x] Create `packages/contracts/`: `openapi.yaml` (all §8 endpoints, camelCase, error schema `{code,message,details}`), `examples/*.json`, `scripts/drift-check.mjs` (OpenAPI ↔ zod ↔ examples).
+- [x] Frontend alias `@eb/contracts` → `../packages/contracts/src` (tsconfig + vite resolve.alias); smoke-test build.
+- [x] Root `README.md` (roadmap stub), `Makefile` (test/lint/build), `pnpm-workspace.yaml`.
 
 **Tests:** vitest smoke green; drift-check green against current schemas.
 **Gate G0:** build + typecheck + lint + smoke tests pass; AUDIT.md committed.

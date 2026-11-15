@@ -1,0 +1,12 @@
+{
+  "target": { "deviceId": "device-1", "cls": "call" },
+  "goal": "Keep the call stable",
+  "priority": "high",
+  "durationSeconds": 900,
+  "deadline": null,
+  "allowedTradeoffs": ["reduce-bulk"],
+  "minServiceFloor": true,
+  "id": "intent-1",
+  "expiresAt": "2026-11-15T10:15:00Z",
+  "status": "active"
+}

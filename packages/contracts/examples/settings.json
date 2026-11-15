@@ -1,0 +1,12 @@
+{
+  "floorMbps": 2,
+  "rateChangePct": 20,
+  "dwellSeconds": 30,
+  "forecastThreshold": 0.8,
+  "classifierThreshold": 0.75,
+  "intervalSeconds": 30,
+  "retentionDays": 30,
+  "federated": false,
+  "demandLearning": true,
+  "flags": { "conflicts": true, "health": true }
+}
