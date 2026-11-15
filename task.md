@@ -148,12 +148,12 @@ experience-budget/
 ### Phase 1 — Reproducible lab
 **Goal:** one command → baseline CSV (call + ISO download).
 
-- [ ] `agent/eb_agent/lab/topology.py`: netns household namespaces + veth + router namespace + netem on WAN side; deterministic setup/teardown; `scripts/reset_lab.sh` (one-command state reset).
-- [ ] `lab/workloads.py`: iperf3 bulk, ping RTT, flent (RRUL), synthetic call/game/stream generators.
-- [ ] `lab/traffic_gen.py`: deterministic seeded trace generator — call (small periodic UDP), game (tiny frequent packets, low rate), stream (chunked bursts), bulk (saturating TCP), noise, seeds, **encrypted/same-port subset** where port rules fail; exports dataset CSV + model card input.
-- [ ] `lab/harness.py`: run a controller profile over identical workloads/seeds/link traces; CSV collector (call p95 RTT, jitter p95/p99, bulk progress, worst-device QoE, CPU, packets/s).
-- [ ] Controllers v0: `unmanaged`, `cake_static`.
-- [ ] Makefile targets `lab-demo`, `reset-lab`; `docs/lab.md`.
+- [x] `agent/eb_agent/lab/topology.py`: netns household namespaces + veth + router namespace + netem on WAN side; deterministic setup/teardown; `scripts/reset_lab.sh` (one-command state reset).
+- [x] `lab/workloads.py`: iperf3 bulk, ping RTT, flent (RRUL), synthetic call/game/stream generators.
+- [x] `lab/traffic_gen.py`: deterministic seeded trace generator — call (small periodic UDP), game (tiny frequent packets, low rate), stream (chunked bursts), bulk (saturating TCP), noise, seeds, **encrypted/same-port subset** where port rules fail; exports dataset CSV + model card input.
+- [x] `lab/harness.py`: run a controller profile over identical workloads/seeds/link traces; CSV collector (call p95 RTT, jitter p95/p99, bulk progress, worst-device QoE, CPU, packets/s).
+- [x] Controllers v0: `unmanaged`, `cake_static`.
+- [x] Makefile targets `lab-demo`, `reset-lab`; `docs/lab.md`.
 
 **Tests:** traffic-gen determinism (fixed seed); topology smoke `@pytest.mark.netns` (CI privileged).
 **Gate G1:** one command yields baseline CSV on Linux/WSL2/CI.

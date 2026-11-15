@@ -18,6 +18,22 @@ pnpm dev
 By default the UI uses the in-browser `MockTransport`. The `relay` and `direct`
 transports are explicit stubs and do not connect to an agent.
 
+## Reproducible lab (Phase 1)
+
+The lab creates real Linux namespaces, veth links, and `tc`/`netem` shaping
+inside a private user+network namespace. It never touches the host's real WAN.
+
+```sh
+make agent-install
+make lab-demo        # 4 devices x 2 controllers -> reports/lab/baseline.csv
+make reset-lab
+make test-agent      # fast unit tests
+make test-netns      # real veth/netem/CAKE integration (no sudo)
+```
+
+See [`docs/lab.md`](docs/lab.md) for the topology, workloads, CSV columns, and
+limitations. All lab data is marked **EMULATED**.
+
 ## Python environment
 
 Use the project-local virtual environment for Python tools and packages:
@@ -26,11 +42,12 @@ Use the project-local virtual environment for Python tools and packages:
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip
+make agent-install
 ```
 
-Python dependencies for the agent will be declared in `agent/pyproject.toml`
-when that package is implemented. Do not install project Python dependencies
-into the system interpreter.
+Python dependencies are declared in `agent/pyproject.toml` and installed only
+into `.venv`. Do not install project Python dependencies into the system
+interpreter.
 
 ## Checks
 

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "experience-budget-agent"
+version = "0.1.0"
+description = "Experience Budget agent: lab, enforcer, API, and analytics"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["eb_agent*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "netns: requires a Linux network namespace with CAP_NET_ADMIN (run under unshare -Urn)",
+]
+addopts = "-ra"
