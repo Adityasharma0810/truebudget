@@ -20,7 +20,7 @@ const Links = lazy(() =>
 const Agent = lazy(() =>
   import("./features/advanced/Advanced").then((m) => ({ default: m.Agent })),
 );
-const MockPanel = lazy(() => import("./dev/MockControlPanel"));
+const DevPanel = lazy(() => import("./dev/MockControlPanel"));
 const Lab = lazy(() => import("./features/lab/Lab"));
 const Experiments = lazy(() => import("./features/experiments/Experiments"));
 const ML = lazy(() => import("./features/ml/ML"));
@@ -86,7 +86,7 @@ export default function App() {
           <Toasts />
           {import.meta.env.DEV && (
             <Suspense fallback={null}>
-              <MockPanel />
+              <DevPanel />
             </Suspense>
           )}
         </BrowserRouter>

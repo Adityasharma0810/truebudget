@@ -32,6 +32,7 @@ from eb_agent.experiments import ExperimentStore, run_experiment
 from eb_agent.qoe_server import qoe_band
 from eb_agent.federated import get_federated_service
 from eb_agent.rag import get_ask_service
+from eb_agent.dev_control import get_dev_control_service
 from eb_agent.security import AgentIdentity, PairingManager, SessionManager, generate_identity, make_pairing_key, make_pairing_link
 from eb_agent.store import Store
 
@@ -299,6 +300,7 @@ def create_app(
     experiments=None,
     federated=None,
     ask_service=None,
+    dev_control=None,
 ) -> FastAPI:
     app = FastAPI(title="Experience Budget Agent", version=APP_VERSION)
     app.state.config = config
@@ -314,6 +316,7 @@ def create_app(
     app.state.experiments = experiments
     app.state.federated = federated
     app.state.ask = ask_service
+    app.state.dev_control = dev_control
     app.state._started = time.time()
 
     @app.middleware("http")
@@ -983,6 +986,32 @@ def create_app(
         ).fetchall()
         return [dict(r) for r in rows]
 
+    # ------------------------------------------------------------------ dev control
+
+    @app.get("/api/v1/dev/control")
+    async def dev_control_get():
+        dev_control: Optional[DevControlService] = app.state.dev_control
+        if not dev_control:
+            return {"offline": False, "stale": False, "slow": False, "rateLimit": False, "speed": 10, "seed": 4242}
+        return dev_control.get().to_dict()
+
+    @app.patch("/api/v1/dev/control")
+    async def dev_control_patch(request: Request):
+        dev_control: Optional[DevControlService] = app.state.dev_control
+        if not dev_control:
+            raise HTTPException(status_code=404, detail={"code": "not_found", "message": "dev control unavailable"})
+        body = await request.json()
+        state = dev_control.patch(body)
+        return state.to_dict()
+
+    @app.delete("/api/v1/dev/reset")
+    async def dev_reset():
+        dev_control: Optional[DevControlService] = app.state.dev_control
+        if not dev_control:
+            raise HTTPException(status_code=404, detail={"code": "not_found", "message": "dev control unavailable"})
+        state = dev_control.reset()
+        return state.to_dict()
+
     return app
 
 
@@ -1003,6 +1032,7 @@ def run_server(
     experiments=None,
     federated=None,
     ask_service=None,
+    dev_control=None,
 ) -> None:
     """Create the FastAPI app, start the control loops, and serve uvicorn."""
 
@@ -1020,6 +1050,7 @@ def run_server(
         experiments=experiments,
         federated=federated,
         ask_service=ask_service,
+        dev_control=dev_control,
     )
 
     @app.on_event("startup")
@@ -1078,6 +1109,7 @@ if __name__ == "__main__":
     experiments = ExperimentStore()
     federated = get_federated_service()
     ask_service = get_ask_service()
+    dev_control = get_dev_control_service()
     print(f"eb-agentd serving on http://{('0.0.0.0')}:{7443} (mode={config.mode})")
     run_server(
         config,
@@ -1090,6 +1122,7 @@ if __name__ == "__main__":
         experiments=experiments,
         federated=federated,
         ask_service=ask_service,
+        dev_control=dev_control,
     )
 
 

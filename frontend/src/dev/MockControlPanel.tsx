@@ -4,11 +4,11 @@ import { useApi } from "../lib/api";
 import { Button, Modal, useTask, Badge, EmulatedBadge } from "../components/ui";
 import { Toggle } from "../features/settings/Settings";
 import type { MockControl, Capabilities } from "../types";
-export default function MockControlPanel() {
+export default function DevControlPanel() {
   const [open, setOpen] = useState(false);
   const { data, refetch } = useApi<MockControl>("/dev/control", { enabled: open });
   const { data: capabilities } = useApi<Capabilities>("/capabilities");
-  const task = useTask("Mock agent configuration updated.");
+  const task = useTask("Agent configuration updated.");
   useEffect(() => {
     const listener = (e: KeyboardEvent) => {
       if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "m") {
@@ -20,11 +20,10 @@ export default function MockControlPanel() {
     return () => window.removeEventListener("keydown", listener);
   }, []);
   return (
-    <Modal drawer open={open} onClose={() => setOpen(false)} title="Behind the simulation">
+    <Modal drawer open={open} onClose={() => setOpen(false)} title="Dev control panel">
       <EmulatedBadge />
       <p className="field-hint">
-        Development controls · Ctrl + Shift + M. These controls affect only this browser’s mock
-        agent.
+        Development controls · Ctrl + Shift + M. These controls affect the live agent runtime.
       </p>
       {data && (
         <>
@@ -33,7 +32,7 @@ export default function MockControlPanel() {
               <div key={key} className="setting-row">
                 <h3>{key}</h3>
                 <Toggle
-                  label={`Mock ${key}`}
+                  label={key}
                   checked={data[key]}
                   onChange={(value) =>
                     task.mutate(
@@ -96,7 +95,7 @@ export default function MockControlPanel() {
               task.mutate({ path: "/dev/reset" }, { onSuccess: () => location.reload() })
             }
           >
-            <RotateCcw size={13} /> Reset demo & reload
+            <RotateCcw size={13} /> Reset & reload
           </Button>
         </>
       )}
