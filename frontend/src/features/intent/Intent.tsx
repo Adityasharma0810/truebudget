@@ -31,7 +31,7 @@ import type { Intent as IntentType, IntentInput } from "../../types";
 export default function Intent() {
   const { snapshot, settings, capabilities } = useConsole();
   const { data: intents = [], error } = useApi<IntentType[]>("/intents", { refetchInterval: 3000 });
-  const [device, setDevice] = useState(snapshot.devices[0].id);
+  const [device, setDevice] = useState(snapshot.devices[0]?.id ?? "");
   const [cls, setCls] = useState("call");
   const [goal, setGoal] = useState("Prioritize my work call");
   const [priority, setPriority] = useState("high");

@@ -252,7 +252,7 @@ export function Demand() {
   const query = useApi<Schedule[]>("/demand/schedules");
   const [add, setAdd] = useState(false);
   const [name, setName] = useState("");
-  const [device, setDevice] = useState(snapshot.devices[0].name);
+  const [device, setDevice] = useState(snapshot.devices[0]?.name ?? "");
   const [time, setTime] = useState("09:00");
   const [duration, setDuration] = useState("60 min");
   const task = useTask("Demand schedule updated.");

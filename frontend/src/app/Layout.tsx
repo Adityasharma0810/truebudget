@@ -455,7 +455,7 @@ export function FreshnessPill() {
 }
 export function BoostDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { snapshot, settings, capabilities } = useConsole();
-  const [device, setDevice] = useState(snapshot.devices[0].id);
+  const [device, setDevice] = useState(snapshot.devices[0]?.id ?? "");
   const [cls, setCls] = useState("call");
   const [duration, setDuration] = useState("3600");
   const [goal, setGoal] = useState("Prioritize my work call");

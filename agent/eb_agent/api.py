@@ -168,7 +168,7 @@ def _snapshot_to_frontend(core: AgentCore, config: AgentConfig, store: Store) ->
             capacity_mbps=None,
             decisions=[],
             intents=[],
-            emulated=True,
+            emulated=False,
         )
 
     capacity = snap.capacity_mbps or 100.0
@@ -221,7 +221,11 @@ def _snapshot_to_frontend(core: AgentCore, config: AgentConfig, store: Store) ->
                 fl["confidence"] = fq.get("confidence", fl["confidence"])
 
     household = qoe.get("household", {}) if isinstance(qoe, dict) else {}
-    household_qoe = household if isinstance(household, (int, float)) else household.get("qoe")
+    household_qoe = None
+    if isinstance(household, (int, float)):
+        household_qoe = household
+    elif isinstance(household, dict):
+        household_qoe = household.get("qoe")
     worst_id: Optional[str] = None
     worst_qoe: Optional[float] = None
     if isinstance(qoe, dict):
@@ -254,7 +258,7 @@ def _snapshot_to_frontend(core: AgentCore, config: AgentConfig, store: Store) ->
         },
         "household": {
             "qoe": round(household_qoe, 4) if household_qoe is not None else None,
-            "fairness": round(qoe.get("jain", 1.0), 4) if isinstance(qoe, dict) else 1.0,
+            "fairness": round(qoe.get("jain") or 1.0, 4) if isinstance(qoe, dict) else 1.0,
             "worstDeviceId": worst_id,
         },
         "devices": devices_out,
@@ -430,7 +434,7 @@ def create_app(
         tick = core.last_tick
         snap = core.last_snapshot
         return {
-            "emulated": (snap.emulated if snap else True),
+            "emulated": (snap.emulated if snap else False),
             "ts": time.time(),
             "points": [
                 {
@@ -581,7 +585,7 @@ def create_app(
 
     @app.get("/api/v1/ml/metrics")
     async def ml_metrics():
-        return {"emulated": True, "macro_f1": None, "classes": []}
+        return {"emulated": False, "macro_f1": None, "classes": []}
 
     @app.get("/api/v1/qoe/formulas")
     async def qoe_formulas():
@@ -607,12 +611,12 @@ def create_app(
             "version": APP_VERSION,
             "mode": config.mode,
             "uptime_s": time.time() - float(getattr(app.state, "_started", time.time())),
-            "emulated": snap.emulated if snap else True,
+            "emulated": snap.emulated if snap else False,
         }
 
     @app.get("/api/v1/agent/logs")
     async def agent_logs():
-        return {"logs": [], "emulated": True}
+        return {"logs": [], "emulated": False}
 
     @app.post("/api/v1/agent/update-check")
     async def update_check():
@@ -789,14 +793,14 @@ def create_app(
             "id": scenario_id,
             "active": True,
             "started_at": time.time(),
-            "emulated": True,
+            "emulated": False,
         }
         store.execute(
             "INSERT OR REPLACE INTO settings(key, value, updated_at) VALUES (?, ?, ?)",
             (f"scenario:{scenario_id}", json.dumps(scenario), time.time()),
         )
         store.commit()
-        return {"scenario_id": scenario_id, "active": True, "emulated": True}
+        return {"scenario_id": scenario_id, "active": True, "emulated": False}
 
     @app.post("/api/v1/scenarios/stop")
     async def scenarios_stop():
@@ -806,7 +810,7 @@ def create_app(
             "WHERE key LIKE 'scenario:%' AND json_extract(value, '$.active') = 1"
         )
         store.commit()
-        return {"verdict": "scenarios_stopped", "emulated": True}
+        return {"verdict": "scenarios_stopped", "emulated": False}
 
     @app.post("/api/v1/experiments")
     async def experiments_start(request: Request):
@@ -825,7 +829,7 @@ def create_app(
             "trials": exp.trials,
             "progress": exp.progress,
             "status": exp.status,
-            "emulated": True,
+            "emulated": False,
         }
 
     @app.get("/api/v1/experiments")
@@ -850,7 +854,7 @@ def create_app(
                     }
                     for r in e.results
                 ],
-                "emulated": True,
+                "emulated": False,
             }
             for e in experiments.list()
         ]
@@ -878,7 +882,7 @@ def create_app(
                 }
                 for r in exp.results
             ],
-            "emulated": True,
+            "emulated": False,
         }
 
     @app.get("/api/v1/federated/status")
@@ -890,20 +894,20 @@ def create_app(
             "rounds": s.rounds,
             "lastAggregate": s.last_aggregate,
             "participants": s.participants,
-            "emulated": True,
+            "emulated": False,
         }
 
     @app.post("/api/v1/federated/opt-in")
     async def federated_opt_in():
         federated = app.state.federated
         s = federated.opt_in()
-        return {"enabled": s.enabled, "verdict": "opted_in", "emulated": True}
+        return {"enabled": s.enabled, "verdict": "opted_in", "emulated": False}
 
     @app.post("/api/v1/federated/opt-out")
     async def federated_opt_out():
         federated = app.state.federated
         s = federated.opt_out()
-        return {"enabled": s.enabled, "verdict": "opted_out", "emulated": True}
+        return {"enabled": s.enabled, "verdict": "opted_out", "emulated": False}
 
     @app.post("/api/v1/ask")
     async def ask(request: Request):
@@ -915,7 +919,7 @@ def create_app(
             "text": answer.text,
             "citations": answer.citations,
             "disclaimer": answer.disclaimer,
-            "emulated": True,
+            "emulated": False,
         }
 
     @app.get("/api/v1/links")
@@ -926,7 +930,7 @@ def create_app(
 
     @app.post("/api/v1/paths/evaluate")
     async def paths_evaluate():
-        return {"evaluated": [], "emulated": True}
+        return {"evaluated": [], "emulated": False}
 
     @app.get("/api/v1/metrics/internal")
     async def metrics_internal():
@@ -1067,7 +1071,7 @@ if __name__ == "__main__":
         store,
         intent_service=intent_service,
         decision_log=decision_log,
-        emulated=(config.mode == "lab" or config.mode == "monitor"),
+        emulated=False,
     )
     health = get_health_service()
     negotiation = get_negotiation_service()

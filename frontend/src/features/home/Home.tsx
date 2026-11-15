@@ -54,7 +54,7 @@ export default function Home() {
   });
   const { data: decisions = [] } = useApi<Decision[]>("/decisions");
   const { data: intents = [] } = useApi<Intent[]>("/intents");
-  const [boostDevice, setBoostDevice] = useState(s.devices[0].id);
+  const [boostDevice, setBoostDevice] = useState(s.devices[0]?.id ?? "");
   const tier = useEffectiveTier();
   const active = s.devices.filter((d) => d.flows.length).length;
   const score = Math.round(s.household.qoe * 100);
@@ -375,7 +375,7 @@ export default function Home() {
             <label className="boost-device-select">
               <span>
                 <DeviceIcon
-                  device={s.devices.find((d) => d.id === boostDevice) ?? s.devices[0]}
+                  device={s.devices.find((d) => d.id === boostDevice) ?? s.devices[0] ?? null}
                   size={15}
                 />
               </span>

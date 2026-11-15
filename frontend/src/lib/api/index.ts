@@ -1,7 +1,6 @@
 import { useQuery, useMutation, useQueryClient, QueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
 import { z } from "zod";
-import { MockTransport } from "../transport/MockTransport";
 import { RelayTransport } from "../transport/RelayTransport";
 import { DirectTransport } from "../transport/DirectTransport";
 import type { Transport } from "../transport/Transport";
@@ -16,13 +15,13 @@ import {
 export const queryClient = new QueryClient({
   defaultOptions: { queries: { retry: 1, staleTime: 1500, refetchOnWindowFocus: false } },
 });
-const mode = import.meta.env?.VITE_TRANSPORT ?? "mock";
+const mode = import.meta.env?.VITE_TRANSPORT ?? "relay";
 let currentTransport: Transport =
   mode === "relay"
     ? new RelayTransport()
     : mode === "direct"
       ? new DirectTransport()
-      : new MockTransport();
+      : (() => { throw new Error(`Unknown transport: ${mode}`); })();
 export function setTransport(t: Transport) {
   currentTransport = t;
 }

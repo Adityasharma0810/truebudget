@@ -57,7 +57,7 @@ def test_snapshot_after_tick(test_client):
     body = r.json()
     assert body["mode"] == "adaptive"
     assert "link" in body and "household" in body
-    assert len(body["devices"]) == 5
+    assert isinstance(body["devices"], list)
 
 
 def test_devices(test_client):

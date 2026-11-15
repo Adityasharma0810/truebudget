@@ -34,10 +34,11 @@ async def test_snapshot_assembly(core) -> None:
     await c._slow_tick()
     snap = c.last_snapshot
     assert isinstance(snap, Snapshot)
-    assert snap.emulated is True
+    assert snap.emulated is False
     assert snap.mode == "lab"
-    assert len(snap.devices) == 5
-    assert len(snap.flows) > 0
+    # Devices come from the store only; no hardcoded defaults.
+    assert isinstance(snap.devices, list)
+    assert isinstance(snap.flows, list)
 
 
 @pytest.mark.asyncio

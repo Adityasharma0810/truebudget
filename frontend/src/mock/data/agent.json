@@ -1,9 +1,0 @@
-{
-  "id": "eb-home-01",
-  "name": "Home network",
-  "version": "0.9.4",
-  "intervalSeconds": 30,
-  "capabilities": ["conflicts", "health", "demand", "links", "federated", "ask"],
-  "emulated": true,
-  "seed": 4242
-}

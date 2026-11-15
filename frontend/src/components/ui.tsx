@@ -320,7 +320,8 @@ export function ConfirmDialog({
     </Modal>
   );
 }
-export function DeviceIcon({ device, size = 21 }: { device: Pick<Device, "type">; size?: number }) {
+export function DeviceIcon({ device, size = 21 }: { device?: Pick<Device, "type"> | null; size?: number }) {
+  if (!device) return null;
   const Icon =
     device.type === "laptop"
       ? Laptop
