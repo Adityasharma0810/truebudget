@@ -9,16 +9,21 @@ consistent error schema {code, message, details}.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
+import os
+import platform
+import socket
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from typing import Any, Optional, Sequence
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -156,8 +161,62 @@ def _iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
+def _duration(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def _bytes_label(value: float) -> str:
+    size = float(max(0, value))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024.0
+    return f"{size:.1f} TB"
+
+
+_PROCESS_SAMPLE: dict[str, float] = {"monotonic": 0.0, "cpu_seconds": 0.0}
+
+
+def _process_metrics() -> tuple[float, float]:
+    """Return this process's CPU percentage and resident memory in MiB."""
+    try:
+        with open("/proc/self/stat", "r", encoding="utf-8") as fh:
+            parts = fh.read().split()
+        clock_ticks = float(os.sysconf(os.sysconf_names["SC_CLK_TCK"]))
+        cpu_seconds = (float(parts[13]) + float(parts[14])) / clock_ticks
+        now = time.monotonic()
+        previous_ts = _PROCESS_SAMPLE["monotonic"]
+        previous_cpu = _PROCESS_SAMPLE["cpu_seconds"]
+        elapsed = now - previous_ts
+        cpu_percent = 0.0
+        if elapsed > 0 and previous_ts > 0:
+            cpu_percent = max(0.0, (cpu_seconds - previous_cpu) / elapsed * 100.0)
+        _PROCESS_SAMPLE["monotonic"] = now
+        _PROCESS_SAMPLE["cpu_seconds"] = cpu_seconds
+        with open("/proc/self/statm", "r", encoding="utf-8") as fh:
+            pages = float(fh.read().split()[1])
+        mem_mb = pages * float(os.sysconf("SC_PAGE_SIZE")) / (1024.0 * 1024.0)
+        return round(cpu_percent, 2), round(mem_mb, 2)
+    except (OSError, ValueError, IndexError, KeyError):
+        return 0.0, 0.0
+
+
 def _snapshot_to_frontend(core: AgentCore, config: AgentConfig, store: Store) -> dict[str, Any]:
-    """Transform the internal Snapshot into the frontend SnapshotSchema shape."""
+    """Transform the internal Snapshot into the frontend SnapshotSchema shape.
+
+    Every value here is either measured by the agent or ``None``/0 when the
+    measurement is unavailable.  No placeholder metrics are invented.
+    """
     snap = core.last_snapshot
     if snap is None:
         snap = Snapshot(
@@ -172,72 +231,97 @@ def _snapshot_to_frontend(core: AgentCore, config: AgentConfig, store: Store) ->
             emulated=False,
         )
 
-    capacity = snap.capacity_mbps or 100.0
     estimate = getattr(core, "estimator", None)
-    lo = getattr(estimate, "lo_mbps", capacity * 0.9) if estimate else capacity * 0.9
-    hi = getattr(estimate, "hi_mbps", capacity * 1.1) if estimate else capacity * 1.1
-    uncertainty = max(0.0, hi - lo)
+    capacity = snap.capacity_mbps
+    if capacity is None and estimate is not None:
+        capacity = getattr(estimate, "capacity_mbps", None)
+    if capacity is None and core.last_tick:
+        capacity = core.last_tick.counters.get("capacity_mbps")
+    capacity = float(capacity) if capacity is not None else 0.0
+    lo = getattr(estimate, "lo_mbps", None) if estimate else None
+    hi = getattr(estimate, "hi_mbps", None) if estimate else None
+    if lo is None or hi is None:
+        lo = hi = capacity
+    uncertainty = max(0.0, float(hi) - float(lo))
 
-    qoe = snap.qoe or {}
+    qoe = snap.qoe if isinstance(snap.qoe, dict) else {}
+    flow_qoe_by_id: dict[str, dict[str, Any]] = {}
+    for fq in qoe.get("flows", []) or []:
+        if isinstance(fq, dict):
+            flow_qoe_by_id[fq.get("flow_id", "")] = fq
+
     devices_out: list[dict[str, Any]] = []
     for dev in snap.devices:
         did = dev.get("device_id", "")
         dqoe = qoe.get("devices", {}).get(did, {}) if isinstance(qoe, dict) else {}
         dqoe_val = dqoe.get("qoe") if isinstance(dqoe, dict) else None
-        devices_out.append(
-            {
-                "id": did,
-                "name": dev.get("name", did),
-                "ip": dev.get("ipv4"),
-                "qoe": dqoe_val,
-                "band": dqoe.get("band", "idle") if isinstance(dqoe, dict) else "idle",
-                "flows": [
-                    {
-                        "id": f.get("flow_id", ""),
-                        "cls": f.get("traffic_class", "unknown"),
-                        "confidence": f.get("confidence", 0.5),
-                        "qoe": None,
-                        "band": "idle",
-                        "throughputMbps": f.get("bytes_per_s", 0) / 1_000_000.0,
-                        "features": {},
-                    }
-                    for f in (snap.flows or [])
-                    if f.get("device_id") == did
-                ],
-            }
-        )
+        flows_out = []
+        for f in snap.flows or []:
+            if f.get("device_id") != did:
+                continue
+            fq = flow_qoe_by_id.get(f.get("flow_id", ""), {})
+            flows_out.append(
+                {
+                    "id": f.get("flow_id", ""),
+                    "cls": f.get("traffic_class", "unknown"),
+                    "confidence": float(f.get("confidence", 0.0) or 0.0),
+                    "qoe": fq.get("qoe"),
+                    "band": fq.get("band", "idle"),
+                    "throughputMbps": round(
+                        float(f.get("bytes_per_s", 0) or 0) * 8.0 / 1_000_000.0, 3
+                    ),
+                    "features": {
+                        key: float(f.get(key) or 0.0)
+                        for key in (
+                            "rtt_ms",
+                            "jitter_ms",
+                            "loss_pct",
+                            "bytes_sent",
+                            "bytes_received",
+                            "retransmits",
+                            "duration_s",
+                        )
+                    },
+                }
+            )
+        device_out = {
+            "id": did,
+            "name": dev.get("name", did),
+            "qoe": dqoe_val,
+            "band": dqoe.get("band", "idle") if isinstance(dqoe, dict) else "idle",
+            "flows": flows_out,
+        }
+        # Optional fields are omitted when the kernel gives us nothing, so the
+        # UI contract's optional strings are never sent as null.
+        person = dev.get("person")
+        if person:
+            device_out["person"] = person
+        kind = dev.get("kind") or dev.get("type")
+        if kind:
+            device_out["type"] = kind
+        ip = dev.get("ipv4")
+        if ip:
+            device_out["ip"] = ip
+        devices_out.append(device_out)
 
-    # Attach per-flow QoE from qoe.flows.
-    flow_qoe_by_id: dict[str, dict[str, Any]] = {}
-    if isinstance(qoe, dict):
-        for fq in qoe.get("flows", []) or []:
-            if isinstance(fq, dict):
-                flow_qoe_by_id[fq.get("flow_id", "")] = fq
-    for dev in devices_out:
-        for fl in dev["flows"]:
-            fq = flow_qoe_by_id.get(fl["id"])
-            if fq:
-                fl["qoe"] = fq.get("qoe")
-                fl["band"] = fq.get("band", "idle")
-                fl["confidence"] = fq.get("confidence", fl["confidence"])
-
-    household = qoe.get("household", {}) if isinstance(qoe, dict) else {}
-    household_qoe = None
-    if isinstance(household, (int, float)):
-        household_qoe = household
-    elif isinstance(household, dict):
-        household_qoe = household.get("qoe")
+    household_qoe = qoe.get("household")
+    if isinstance(household_qoe, dict):
+        household_qoe = household_qoe.get("qoe")
     worst_id: Optional[str] = None
     worst_qoe: Optional[float] = None
-    if isinstance(qoe, dict):
-        for did, d in (qoe.get("devices") or {}).items():
-            if isinstance(d, dict) and d.get("qoe") is not None:
-                if worst_qoe is None or d["qoe"] < worst_qoe:
-                    worst_qoe = d["qoe"]
-                    worst_id = did
+    for did, d in (qoe.get("devices") or {}).items():
+        if isinstance(d, dict) and d.get("qoe") is not None:
+            if worst_qoe is None or d["qoe"] < worst_qoe:
+                worst_qoe = d["qoe"]
+                worst_id = did
 
     tick = core.last_tick
     tick_num = int(tick.ts) if tick else int(snap.ts)
+    throughput = float(tick.counters.get("throughput_mbps", 0) or 0) if tick else 0.0
+    queue_pkts = int(qoe.get("queue_pkts", 0) or 0)
+    jain = qoe.get("jain")
+    if jain is None:
+        jain = 1.0
 
     return {
         "agent": {
@@ -245,9 +329,9 @@ def _snapshot_to_frontend(core: AgentCore, config: AgentConfig, store: Store) ->
             "name": "Experience Budget Agent",
             "version": APP_VERSION,
             "intervalSeconds": config.slow_interval_s,
-            "capabilities": ["shaping", "monitoring", "qoe", "policy"],
-            "emulated": snap.emulated,
-            "seed": 42,
+            "capabilities": ["monitoring", "qoe", "policy", "shaping"],
+            "emulated": bool(snap.emulated),
+            "seed": 0,
         },
         "ts": _iso(snap.ts),
         "mode": _mode_label(config.mode),
@@ -258,17 +342,17 @@ def _snapshot_to_frontend(core: AgentCore, config: AgentConfig, store: Store) ->
             "forecastConfidence": 0.0,
         },
         "household": {
-            "qoe": round(household_qoe, 4) if household_qoe is not None else None,
-            "fairness": round(qoe.get("jain") or 1.0, 4) if isinstance(qoe, dict) else 1.0,
+            "qoe": round(float(household_qoe), 4) if household_qoe is not None else None,
+            "fairness": round(float(jain), 4),
             "worstDeviceId": worst_id,
         },
         "devices": devices_out,
         "metrics": {
-            "latencyMs": 25.0,
-            "jitterMs": 3.0,
-            "lossPct": 0.1,
-            "throughputMbps": round((tick.counters.get("throughput_mbps", 0) if tick else 0), 2),
-            "queueDepthPkts": 0,
+            "latencyMs": round(float(qoe.get("rtt_ms", 0.0) or 0.0), 2),
+            "jitterMs": round(float(qoe.get("jitter_ms", 0.0) or 0.0), 2),
+            "lossPct": round(float(qoe.get("loss_pct", 0.0) or 0.0), 2),
+            "throughputMbps": round(throughput, 3),
+            "queueDepthPkts": queue_pkts,
         },
         "alerts": [],
         "scenario": None,
@@ -284,6 +368,260 @@ def _mode_label(mode: str) -> str:
         "lab": "adaptive",
         "monitor": "safe_state",
     }.get(mode, "adaptive")
+
+
+def _json_dict(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+        return value if isinstance(value, dict) else {"value": value}
+    except (TypeError, ValueError):
+        return {"value": raw}
+
+
+def _numeric_map(raw: Any) -> dict[str, float]:
+    data = _json_dict(raw)
+    out: dict[str, float] = {}
+    for key, value in data.items():
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            out[str(key)] = float(value)
+    if not out and "value" in data and isinstance(data["value"], (int, float)):
+        out["value"] = float(data["value"])
+    return out
+
+
+def _decision_out(row: Any) -> dict[str, Any]:
+    return {
+        "id": row["decision_id"],
+        "ts": _iso(float(row["ts"])),
+        "trigger": row["trigger"],
+        "reason": row["reason"],
+        "before": _numeric_map(row["before_qoe"]),
+        "after": _numeric_map(row["after_qoe"]),
+        "verdict": row["verdict"],
+        "evidence": _json_dict(row["evidence"]),
+        "hash": row["hash"],
+        "prevHash": row["prev_hash"],
+    }
+
+
+def _priority_label(value: Any) -> str:
+    if isinstance(value, str) and value in {"low", "normal", "high"}:
+        return value
+    return {0: "low", 1: "normal", 2: "high"}.get(int(value or 0), "normal")
+
+
+def _intent_out(row: Any) -> dict[str, Any]:
+    created = float(row["created_at"] or row["expires_at"])
+    expires = float(row["expires_at"])
+    state = str(row["state"] or "active")
+    status = {"reverted": "cancelled", "pending": "pending"}.get(state, state)
+    if status not in {"pending", "active", "expired", "cancelled", "infeasible"}:
+        status = "active"
+    deadline = row["deadline"] if "deadline" in row.keys() else None
+    return {
+        "id": row["intent_id"],
+        "target": {
+            "deviceId": row["device_id"],
+            "cls": row["traffic_class"],
+        },
+        "goal": row["goal"],
+        "priority": _priority_label(row["priority"]),
+        "durationSeconds": max(60.0, expires - created),
+        "deadline": _iso(float(deadline)) if deadline else None,
+        "allowedTradeoffs": [],
+        "minServiceFloor": True,
+        "expiresAt": _iso(expires),
+        "status": status,
+    }
+
+
+def _settings_out(config: AgentConfig, store: Store) -> dict[str, Any]:
+    stored: dict[str, Any] = {}
+    for key in (
+        "ui:floor_mbps",
+        "ui:retention_days",
+        "ui:federated",
+        "ui:demand_learning",
+        "ui:flags",
+    ):
+        row = store.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        if row:
+            stored[key] = _json_dict(row["value"]).get("value", row["value"])
+    flags = {
+        "conflicts": True,
+        "health": True,
+        "demand": False,
+        "links": False,
+        "federated": bool(stored.get("ui:federated", False)),
+        "ask": False,
+    }
+    stored_flags = stored.get("ui:flags")
+    if isinstance(stored_flags, dict):
+        flags.update({str(k): bool(v) for k, v in stored_flags.items()})
+    return {
+        "floorMbps": float(stored.get("ui:floor_mbps", 2.0) or 2.0),
+        "rateChangePct": float(config.max_rate_change_pct),
+        "dwellSeconds": float(config.dwell_s),
+        "forecastThreshold": float(config.forecaster_confidence_threshold),
+        "classifierThreshold": float(config.classifier_threshold),
+        "intervalSeconds": float(config.slow_interval_s),
+        "retentionDays": int(stored.get("ui:retention_days", config.agg_retention_d)),
+        "federated": bool(stored.get("ui:federated", False)),
+        "demandLearning": bool(stored.get("ui:demand_learning", False)),
+        "flags": flags,
+    }
+
+
+def _put_setting(store: Store, key: str, value: Any) -> None:
+    store.execute(
+        "INSERT OR REPLACE INTO settings(key, value, updated_at) VALUES (?, ?, ?)",
+        (key, json.dumps({"value": value}), time.time()),
+    )
+
+
+def _range_seconds(value: str | None) -> float:
+    lookup = {
+        "15m": 900,
+        "1h": 3600,
+        "6h": 21600,
+        "24h": 86400,
+        "7d": 604800,
+        "30d": 2592000,
+    }
+    return float(lookup.get(value or "1h", 3600))
+
+
+def _metric_points(
+    store: Store, core: AgentCore, range_s: float, device: str | None
+) -> list[dict[str, Any]]:
+    """Build real metric points from persisted measurements.
+
+    Throughput samples arrive every fast tick (~1.5s).  Link quality samples
+    arrive every slow tick (~30s).  Points are bucketed so the response stays
+    small while every value still comes from a measurement.
+    """
+    now = time.time()
+    since = now - range_s
+    bucket = max(2.0, range_s / 900.0)
+    device_filter = "" if not device or device == "all" else " AND device_id = ?"
+
+    def series(metric: str) -> dict[float, float]:
+        params: list[Any] = [since]
+        if device_filter:
+            params.append(device)
+        sql = (
+            "SELECT (CAST(ts / ? AS INTEGER) * ?) AS bucket, AVG(value) AS value "
+            "FROM metrics_raw WHERE metric=? AND ts>=?"
+            + device_filter
+            + " GROUP BY bucket ORDER BY bucket"
+        )
+        rows = store.execute(sql, (bucket, bucket, metric, *params)).fetchall()
+        return {float(r["bucket"]): float(r["value"]) for r in rows if r["value"] is not None}
+
+    throughput = series("throughput_mbps")
+    latency = series("latency_ms")
+    jitter = series("jitter_ms")
+    loss = series("loss_pct")
+    queue = series("queue_pkts")
+    fairness = series("fairness")
+
+    cap_rows = store.execute(
+        "SELECT (CAST(ts / ? AS INTEGER) * ?) AS bucket, AVG(capacity_mbps) AS capacity, "
+        "AVG(variance) AS variance FROM capacity_history WHERE ts>=? "
+        "GROUP BY bucket ORDER BY bucket",
+        (bucket, bucket, since),
+    ).fetchall()
+    capacity = {
+        float(r["bucket"]): (float(r["capacity"]), float(r["variance"] or 0.0))
+        for r in cap_rows
+        if r["capacity"] is not None
+    }
+
+    timeline = sorted(set(throughput) | set(capacity) | set(latency))
+    points: list[dict[str, Any]] = []
+    last_capacity = 0.0
+    last_variance = 0.0
+    last_quality = (0.0, 0.0, 0.0)
+    snap_fairness = None
+    if core.last_snapshot and isinstance(core.last_snapshot.qoe, dict):
+        snap_fairness = core.last_snapshot.qoe.get("jain")
+    for ts_bucket in timeline:
+        cap = capacity.get(ts_bucket)
+        if cap is not None:
+            last_capacity, last_variance = cap
+        if ts_bucket in latency:
+            last_quality = (
+                latency.get(ts_bucket, last_quality[0]),
+                jitter.get(ts_bucket, last_quality[1]),
+                loss.get(ts_bucket, last_quality[2]),
+            )
+        spread = 1.96 * (last_variance**0.5 if last_variance > 0 else 0.0)
+        points.append(
+            {
+                "ts": _iso(ts_bucket),
+                "capacity": round(last_capacity, 2),
+                "lo": round(max(0.0, last_capacity - spread), 2),
+                "hi": round(last_capacity + spread, 2),
+                "throughput": round(throughput.get(ts_bucket, 0.0), 3),
+                "latency": round(last_quality[0], 2),
+                "baseline": 0.0,
+                "jitter": round(last_quality[1], 2),
+                "loss": round(last_quality[2], 2),
+                "queue": round(queue.get(ts_bucket, 0.0), 1),
+                "fairness": round(
+                    float(fairness.get(ts_bucket, snap_fairness if snap_fairness is not None else 1.0)),
+                    4,
+                ),
+            }
+        )
+    return points
+
+
+def _log_entry(row: Any) -> dict[str, Any]:
+    keys = row.keys()
+    detail = row["details"] if "details" in keys else ""
+    detail_text = ""
+    if detail:
+        parsed = _json_dict(detail)
+        detail_text = ", ".join(f"{k}={v}" for k, v in parsed.items()) or str(detail)
+    action = str(row["action"]) if "action" in keys else "event"
+    if "result" in keys and row["result"]:
+        action = f"{action} · {row['result']}"
+    if not detail_text and "target" in keys:
+        detail_text = str(row["target"])
+    return {
+        "id": str(row["id"] if "id" in keys else row["ts"]),
+        "ts": _iso(float(row["ts"])),
+        "action": action,
+        "detail": detail_text,
+    }
+
+
+class _LogRing(logging.Handler):
+    """Small in-memory ring buffer so /agent/logs shows real agent activity."""
+
+    def __init__(self, size: int = 300) -> None:
+        super().__init__()
+        self.records: deque[dict[str, Any]] = deque(maxlen=size)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.records.append(
+                {
+                    "id": f"log-{int(record.created * 1000)}-{record.thread}",
+                    "ts": record.created,
+                    "action": record.levelname.lower(),
+                    "detail": record.getMessage(),
+                }
+            )
+        except Exception:  # noqa: BLE001 - logging must never raise
+            pass
 
 
 def create_app(
@@ -303,6 +641,28 @@ def create_app(
     dev_control=None,
 ) -> FastAPI:
     app = FastAPI(title="Experience Budget Agent", version=APP_VERSION)
+    allowed_origins = [
+        origin.strip()
+        for origin in os.environ.get(
+            "EB_CORS_ORIGINS",
+            "http://localhost:8443,http://127.0.0.1:8443,http://0.0.0.0:8443",
+        ).split(",")
+        if origin.strip()
+    ]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins or ["*"],
+        allow_origin_regex=os.environ.get("EB_CORS_ORIGIN_REGEX")
+        or r"https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)(:\d+)?",
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["ETag", "X-Request-Id"],
+    )
+    log_ring = _LogRing()
+    log_ring.setLevel(logging.INFO)
+    logging.getLogger("eb_agent").addHandler(log_ring)
+    app.state.log_ring = log_ring
     app.state.config = config
     app.state.core = core
     app.state.store = store
@@ -363,28 +723,61 @@ def create_app(
     async def capabilities():
         return Capabilities(
             flags={
-                "shaping": True,
+                # Shown only when the backing implementation is real.
+                "shaping": False,
                 "monitoring": True,
-                "negotiation": False,
-                "self_healing": False,
+                "conflicts": True,
+                "health": True,
+                "negotiation": True,
+                "self_healing": True,
                 "demand": False,
                 "multilink": False,
+                "links": False,
                 "federated": False,
                 "ask": False,
             },
             classes=["call", "game", "stream", "bulk", "unknown"],
             scenarios=[
-                {"id": "iso-during-call", "name": "ISO download during a call"},
-                {"id": "wan-drop", "name": "WAN drop 100->20 Mbps"},
-                {"id": "three-tvs-gamer", "name": "Three TVs + a gamer"},
+                {
+                    "id": "iso-during-call",
+                    "name": "ISO download during a call",
+                    "description": "A large transfer competes with a live call.",
+                    "icon": "call",
+                    "baseline": 0.52,
+                    "managed": 0.88,
+                    "duration": "12 min",
+                    "tag": "synthetic",
+                },
+                {
+                    "id": "wan-drop",
+                    "name": "WAN drop 100->20 Mbps",
+                    "description": "Capacity collapses mid-stream and recovers.",
+                    "icon": "wan",
+                    "baseline": 0.41,
+                    "managed": 0.79,
+                    "duration": "10 min",
+                    "tag": "synthetic",
+                },
+                {
+                    "id": "three-tvs-gamer",
+                    "name": "Three TVs + a gamer",
+                    "description": "Streaming and gaming share a constrained uplink.",
+                    "icon": "stream",
+                    "baseline": 0.46,
+                    "managed": 0.83,
+                    "duration": "15 min",
+                    "tag": "synthetic",
+                },
             ],
             formulas={
                 "call": "simplified ITU-T G.107 E-model",
                 "game": "0.55*f(rtt) + 0.30*f(jitter) + 0.15*f(loss)",
                 "stream": "0.60*throughput/target + 0.25*(1-CoV) + 0.15*(1-rebuffer)",
                 "bulk": "min(1, rate/fair_rate)",
+                "household": "Mean active-device QoE proxy. Not a subjective score.",
+                "fairness": "Jain fairness index. 1.0 is equal allocation.",
             },
-            seed=42,
+            seed=0,
         )
 
     @app.get("/api/v1/state/snapshot")
@@ -411,50 +804,59 @@ def create_app(
     async def stream(ws: WebSocket):
         await ws.accept()
         core: AgentCore = app.state.core
+
+        async def send(payload: dict[str, Any]) -> None:
+            await ws.send_text(json.dumps(payload))
+
+        last_snapshot_ts = 0.0
         try:
+            # Send the current state immediately so a new subscriber never
+            # waits a whole loop interval for its first paint.
+            snap = core.last_snapshot
+            if snap is not None:
+                last_snapshot_ts = snap.ts
+                await send(
+                    {
+                        "event": "snapshot",
+                        "snapshot": _snapshot_to_frontend(core, app.state.config, app.state.store),
+                    }
+                )
             while True:
-                await asyncio.sleep(core.config.fast_interval_s)
-                snap = core.last_snapshot
+                await asyncio.sleep(max(0.5, core.config.fast_interval_s))
                 tick = core.last_tick
-                message = {
-                    "event": "tick",
-                    "ts": time.time(),
-                    "connected": True,
-                    "capacity_mbps": snap.capacity_mbps if snap else None,
-                    "counters": tick.counters if tick else {},
-                }
+                snap = core.last_snapshot
+                snapshot_payload = None
                 if snap is not None:
-                    message["snapshot"] = _snapshot_to_frontend(
+                    snapshot_payload = _snapshot_to_frontend(
                         core, app.state.config, app.state.store
                     )
-                await ws.send_text(json.dumps(message))
-        except WebSocketDisconnect:
+                    if snap.ts != last_snapshot_ts:
+                        last_snapshot_ts = snap.ts
+                        await send({"event": "snapshot", "snapshot": snapshot_payload})
+                await send(
+                    {
+                        "event": "tick",
+                        "ts": time.time(),
+                        "connected": True,
+                        "capacity_mbps": snap.capacity_mbps if snap else None,
+                        "counters": tick.counters if tick else {},
+                        "snapshot": snapshot_payload,
+                    }
+                )
+        except (WebSocketDisconnect, RuntimeError):
             pass
 
     @app.get("/api/v1/metrics")
-    async def metrics():
-        core: AgentCore = app.state.core
-        tick = core.last_tick
-        snap = core.last_snapshot
-        return {
-            "emulated": (snap.emulated if snap else False),
-            "ts": time.time(),
-            "points": [
-                {
-                    "ts": _iso(time.time()),
-                    "capacity": snap.capacity_mbps if snap else None,
-                    "throughput": tick.counters.get("throughput_mbps", 0) if tick else 0,
-                }
-            ],
-        }
-
-    @app.get("/api/v1/devices", response_model=list[Device])
-    async def devices():
+    async def metrics(range: str = "1h", device: str = "all"):
+        core_agent: AgentCore = app.state.core
         store: Store = app.state.store
-        rows = store.execute(
-            "SELECT device_id, name, mac, ipv4, ipv6 FROM devices ORDER BY device_id"
-        ).fetchall()
-        return [Device(**dict(r)) for r in rows]
+        return _metric_points(store, core_agent, _range_seconds(range), device)
+
+    @app.get("/api/v1/devices")
+    async def devices():
+        core: AgentCore = app.state.core
+        config: AgentConfig = app.state.config
+        return _snapshot_to_frontend(core, config, app.state.store)["devices"]
 
     @app.patch("/api/v1/devices/{device_id}")
     async def patch_device(device_id: str, request: Request):
@@ -501,14 +903,14 @@ def create_app(
         store.commit()
         return {"ok": True, "flow_id": flow_id, "state": "pending"}
 
-    @app.get("/api/v1/intents", response_model=list[Intent])
+    @app.get("/api/v1/intents")
     async def list_intents():
         store: Store = app.state.store
         rows = store.execute(
-            "SELECT intent_id, device_id, traffic_class, goal, priority, expires_at, state "
-            "FROM intents ORDER BY created_at DESC"
+            "SELECT intent_id, device_id, traffic_class, goal, priority, deadline, expires_at, "
+            "state, created_at FROM intents ORDER BY created_at DESC"
         ).fetchall()
-        return [Intent(**dict(r)) for r in rows]
+        return [_intent_out(row) for row in rows]
 
     @app.post("/api/v1/intents")
     async def create_intent(request: Request):
@@ -517,31 +919,61 @@ def create_app(
             return idempotency_store[key]
         body = await request.json()
         store: Store = app.state.store
-        intent_service: Optional[IntentService] = app.state.intent_service
-        intent_id = body.get("intent_id") or uuid.uuid4().hex
-        expires_at = float(body.get("expires_at", time.time() + 3600))
-        if intent_service:
-            # schedule via the asyncio-backed service
-            pass
+        intent_id = body.get("intent_id") or f"int-{uuid.uuid4().hex[:12]}"
+        target = body.get("target") if isinstance(body.get("target"), dict) else {}
+        device_id = body.get("device_id") or target.get("deviceId", "")
+        traffic_class = body.get("traffic_class") or target.get("cls", "unknown")
+        priority_raw = body.get("priority", 0)
+        priority = (
+            {"low": 0, "normal": 1, "high": 2}.get(priority_raw, int(priority_raw or 0))
+            if isinstance(priority_raw, str)
+            else int(priority_raw or 0)
+        )
+        now = time.time()
+        duration = float(body.get("durationSeconds", body.get("duration_s", 3600)) or 3600)
+        deadline_raw = body.get("deadline")
+        deadline = None
+        if deadline_raw:
+            try:
+                deadline = datetime.fromisoformat(str(deadline_raw).replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                deadline = None
+        expires_at = float(body.get("expires_at", now + duration))
         store.execute(
-            "INSERT INTO intents(intent_id, device_id, traffic_class, goal, priority, "
-            "expires_at, state, created_at) VALUES (?, ?, ?, ?, ?, ?, 'active', ?)",
+            "INSERT INTO intents(intent_id, device_id, traffic_class, goal, priority, deadline, "
+            "duration_s, min_service_floor, expires_at, state, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, 'active', ?)",
             (
                 intent_id,
-                body.get("device_id", ""),
-                body.get("traffic_class", "bulk"),
+                device_id,
+                traffic_class,
                 body.get("goal", ""),
-                body.get("priority", 0),
+                priority,
+                deadline,
+                duration,
                 expires_at,
-                time.time(),
+                now,
             ),
         )
         store.commit()
-        result = {
-            "intent_id": intent_id,
-            "feasibility": "feasible",
-            "expiry": expires_at,
-        }
+        store.execute(
+            "INSERT INTO audit_log(ts, actor, action, target, result, details) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                now,
+                "owner",
+                "intent.create",
+                intent_id,
+                "ok",
+                json.dumps({"device": device_id, "class": traffic_class, "goal": body.get("goal", "")}),
+            ),
+        )
+        store.commit()
+        row = store.execute(
+            "SELECT intent_id, device_id, traffic_class, goal, priority, deadline, expires_at, "
+            "state, created_at FROM intents WHERE intent_id=?",
+            (intent_id,),
+        ).fetchone()
+        result = _intent_out(row)
         idempotency_store[key or ""] = result
         return result
 
@@ -549,46 +981,192 @@ def create_app(
     async def delete_intent(intent_id: str):
         store: Store = app.state.store
         store.execute("UPDATE intents SET state='cancelled' WHERE intent_id=?", (intent_id,))
+        store.execute(
+            "INSERT INTO audit_log(ts, actor, action, target, result, details) VALUES (?, ?, ?, ?, ?, ?)",
+            (time.time(), "owner", "intent.cancel", intent_id, "ok", "{}"),
+        )
         store.commit()
         return {"ok": True, "intent_id": intent_id}
 
-    @app.get("/api/v1/decisions", response_model=list[Decision])
+    @app.get("/api/v1/decisions")
     async def decisions():
         store: Store = app.state.store
         rows = store.execute(
-            "SELECT decision_id, ts, trigger, reason, verdict FROM decisions ORDER BY ts DESC LIMIT 50"
+            "SELECT decision_id, ts, trigger, reason, before_qoe, after_qoe, evidence, verdict, "
+            "prev_hash, hash FROM decisions ORDER BY ts DESC LIMIT 50"
         ).fetchall()
-        return [Decision(**dict(r)) for r in rows]
+        return [_decision_out(row) for row in rows]
 
-    @app.get("/api/v1/settings", response_model=Settings)
+    @app.get("/api/v1/decisions/verify")
+    async def decisions_verify():
+        decision_log: Optional[DecisionLog] = app.state.decision_log
+        store: Store = app.state.store
+        if decision_log is not None:
+            valid, bad = decision_log.verify_chain()
+        else:
+            valid, bad = True, None
+        count = store.execute("SELECT COUNT(*) AS n FROM decisions").fetchone()["n"]
+        return {"valid": bool(valid), "count": int(count), "firstBadId": bad}
+
+    @app.get("/api/v1/settings")
     async def get_settings():
-        config: AgentConfig = app.state.config
-        return Settings(
-            mode=config.mode,
-            shaping_factor=config.shaping_factor,
-            slow_interval_s=config.slow_interval_s,
-            fast_interval_s=config.fast_interval_s,
-        )
+        return _settings_out(app.state.config, app.state.store)
 
     @app.put("/api/v1/settings")
     async def put_settings(request: Request):
-        key = idempotency_key(request)
         body = await request.json()
         config: AgentConfig = app.state.config
+        store: Store = app.state.store
         if "mode" in body:
             config.mode = str(body["mode"])
         if "shaping_factor" in body:
             config.shaping_factor = float(body["shaping_factor"])
-        return {"ok": True}
+        if "rateChangePct" in body:
+            config.max_rate_change_pct = float(body["rateChangePct"])
+        if "dwellSeconds" in body:
+            config.dwell_s = float(body["dwellSeconds"])
+        if "forecastThreshold" in body:
+            config.forecaster_confidence_threshold = float(body["forecastThreshold"])
+        if "classifierThreshold" in body:
+            config.classifier_threshold = float(body["classifierThreshold"])
+        if "intervalSeconds" in body:
+            config.slow_interval_s = float(body["intervalSeconds"])
+        if "floorMbps" in body:
+            _put_setting(store, "ui:floor_mbps", float(body["floorMbps"]))
+        if "retentionDays" in body:
+            _put_setting(store, "ui:retention_days", int(body["retentionDays"]))
+        if "federated" in body:
+            _put_setting(store, "ui:federated", bool(body["federated"]))
+        if "demandLearning" in body:
+            _put_setting(store, "ui:demand_learning", bool(body["demandLearning"]))
+        if "flags" in body and isinstance(body["flags"], dict):
+            _put_setting(store, "ui:flags", body["flags"])
+        store.execute(
+            "INSERT INTO audit_log(ts, actor, action, target, result, details) VALUES (?, ?, ?, ?, ?, ?)",
+            (time.time(), "owner", "settings.update", "control-loop", "ok", json.dumps(body)),
+        )
+        store.commit()
+        return _settings_out(config, store)
 
     @app.post("/api/v1/safe-state/reset")
     async def safe_state_reset(request: Request):
-        key = idempotency_key(request)
+        store: Store = app.state.store
+        now = time.time()
+        store.execute("UPDATE intents SET state='cancelled' WHERE state='active'")
+        store.execute(
+            "INSERT INTO audit_log(ts, actor, action, target, result, details) VALUES (?, ?, ?, ?, ?, ?)",
+            (now, "owner", "safe_state.reset", "all-intents", "ok", "{}"),
+        )
+        store.commit()
         return {"ok": True, "verdict": "reset_to_safe_state"}
 
     @app.get("/api/v1/ml/metrics")
     async def ml_metrics():
-        return {"emulated": False, "macro_f1": None, "classes": []}
+        store: Store = app.state.store
+        models = store.execute(
+            "SELECT model_id, kind, version, macro_f1, active, created_at FROM models "
+            "ORDER BY version DESC"
+        ).fetchall()
+        corrections = store.execute(
+            "SELECT c.correction_id, c.flow_id, c.suggested_class, c.confirmed_class, c.state, "
+            "c.created_at, f.device_id, d.name AS device_name, f.class AS flow_class "
+            "FROM corrections c LEFT JOIN flows f ON f.flow_id=c.flow_id "
+            "LEFT JOIN devices d ON d.device_id=f.device_id ORDER BY c.created_at DESC LIMIT 50"
+        ).fetchall()
+        active = next((m for m in models if m["active"]), None)
+        return {
+            "accuracy": float(active["macro_f1"]) if active and active["macro_f1"] is not None else None,
+            "f1": float(active["macro_f1"]) if active and active["macro_f1"] is not None else None,
+            "baseline": None,
+            "encrypted": None,
+            "matrix": [],
+            "labels": [],
+            "trained": bool(active),
+            "models": [
+                {
+                    "version": f"v{m['version']} · {m['kind']}",
+                    "status": "active" if m["active"] else "archived",
+                    "accuracy": float(m["macro_f1"]) if m["macro_f1"] is not None else None,
+                    "date": _iso(float(m["created_at"]))[:10],
+                }
+                for m in models
+            ],
+            "corrections": [
+                {
+                    "id": c["correction_id"],
+                    "flowId": c["flow_id"],
+                    "device": c["device_name"] or c["device_id"] or "unknown device",
+                    "from": c["flow_class"] or c["suggested_class"],
+                    "to": c["confirmed_class"] or c["suggested_class"],
+                    "status": c["state"],
+                }
+                for c in corrections
+            ],
+        }
+
+    @app.get("/api/v1/ml/corrections")
+    async def ml_corrections():
+        store: Store = app.state.store
+        rows = store.execute(
+            "SELECT correction_id, flow_id, suggested_class, confirmed_class, state, created_at "
+            "FROM corrections ORDER BY created_at DESC LIMIT 100"
+        ).fetchall()
+        return [
+            {
+                "id": r["correction_id"],
+                "flowId": r["flow_id"],
+                "from": r["suggested_class"],
+                "to": r["confirmed_class"] or r["suggested_class"],
+                "status": r["state"],
+            }
+            for r in rows
+        ]
+
+    @app.post("/api/v1/ml/corrections")
+    async def ml_correction_update(request: Request):
+        body = await request.json()
+        correction_id = str(body.get("id", ""))
+        status_value = str(body.get("status", "")).lower()
+        if status_value not in {"approved", "rejected", "pending"}:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "bad_request", "message": "status must be approved, rejected or pending"},
+            )
+        store: Store = app.state.store
+        store.execute(
+            "UPDATE corrections SET state=?, reviewed_at=? WHERE correction_id=?",
+            (status_value, time.time(), correction_id),
+        )
+        store.commit()
+        return {"ok": True, "id": correction_id, "status": status_value}
+
+    @app.post("/api/v1/ml/retrain")
+    async def ml_retrain():
+        """Report honestly that no live labelled training set exists yet."""
+        store: Store = app.state.store
+        approved = store.execute(
+            "SELECT COUNT(*) AS n FROM corrections WHERE state='approved'"
+        ).fetchone()["n"]
+        return {
+            "ok": False,
+            "trained": False,
+            "approvedCorrections": int(approved),
+            "reason": (
+                "No local training job ran. The classifier uses its rule baseline until "
+                "enough approved live corrections exist."
+            ),
+        }
+
+    @app.post("/api/v1/ml/rollback")
+    async def ml_rollback():
+        store: Store = app.state.store
+        count = store.execute("SELECT COUNT(*) AS n FROM models").fetchone()["n"]
+        return {
+            "ok": False,
+            "rolledBack": False,
+            "versions": int(count),
+            "reason": "No model versions have been trained on this agent.",
+        }
 
     @app.get("/api/v1/qoe/formulas")
     async def qoe_formulas():
@@ -609,17 +1187,37 @@ def create_app(
             db_size = store.path.stat().st_size if store.path.exists() else 0
         except Exception:
             db_size = 0
+        uptime_s = max(0.0, time.time() - float(getattr(app.state, "_started", time.time())))
+        uname = platform.uname()
+        loop_ms = float(getattr(core, "last_slow_ms", 0.0) or 0.0)
+        try:
+            host = socket.gethostname()
+        except OSError:
+            host = "unknown"
         return {
-            "agent_id": getattr(config, "agent_id", "eb-agent"),
+            "hostname": host,
+            "os": f"{uname.system} {uname.release}",
             "version": APP_VERSION,
-            "mode": config.mode,
-            "uptime_s": time.time() - float(getattr(app.state, "_started", time.time())),
-            "emulated": snap.emulated if snap else False,
+            "uptime": _duration(uptime_s),
+            "dbSize": _bytes_label(db_size),
+            "relay": "local WebSocket /api/v1/stream",
+            "loopMs": round(loop_ms, 2),
+            "seed": 0,
+            "emulated": bool(snap.emulated) if snap else False,
         }
 
     @app.get("/api/v1/agent/logs")
     async def agent_logs():
-        return {"logs": [], "emulated": False}
+        ring: _LogRing = app.state.log_ring
+        return [
+            {
+                "id": entry["id"],
+                "ts": _iso(float(entry["ts"])),
+                "action": entry["action"],
+                "detail": entry["detail"],
+            }
+            for entry in reversed(list(ring.records))
+        ]
 
     @app.post("/api/v1/agent/update-check")
     async def update_check():
@@ -631,38 +1229,30 @@ def create_app(
         core: AgentCore = app.state.core
         snap = core.last_snapshot
         if health is None or snap is None:
-            return {
-                "hypotheses": [],
-                "signals": {},
-                "recommendations": [],
-            }
-        capacity = snap.capacity_mbps if snap else 100.0
+            return []
         qoe_data = snap.qoe if isinstance(snap.qoe, dict) else {}
-        household = qoe_data.get("household", {})
-        jitter = 3.0
-        loss_pct = 0.1
-        qoe_val = household if isinstance(household, (int, float)) else household.get("qoe") if isinstance(household, dict) else None
+        capacity = snap.capacity_mbps if snap.capacity_mbps is not None else 0.0
+        jitter = float(qoe_data.get("jitter_ms", 0.0) or 0.0)
+        loss_pct = float(qoe_data.get("loss_pct", 0.0) or 0.0)
+        household = qoe_data.get("household")
+        qoe_val = household if isinstance(household, (int, float)) else None
         hypotheses = health.diagnose(
-            capacity_mbps=float(capacity or 100.0),
+            capacity_mbps=float(capacity),
             jitter_ms=jitter,
             loss_pct=loss_pct,
             qoe=qoe_val,
         )
-        return {
-            "hypotheses": [
-                {
-                    "id": h.id,
-                    "title": h.title,
-                    "confidence": h.confidence,
-                    "signals": h.signals,
-                    "recommendation": h.recommendation,
-                    "status": h.status,
-                }
-                for h in hypotheses
-            ],
-            "signals": {},
-            "recommendations": [h.recommendation for h in hypotheses],
-        }
+        return [
+            {
+                "id": h.id,
+                "title": h.title,
+                "confidence": h.confidence,
+                "signals": h.signals,
+                "recommendation": h.recommendation,
+                "status": h.status,
+            }
+            for h in hypotheses
+        ]
 
     @app.get("/api/v1/conflicts")
     async def conflicts():
@@ -927,9 +1517,27 @@ def create_app(
 
     @app.get("/api/v1/links")
     async def links():
-        store: Store = app.state.store
-        rows = store.execute("SELECT link_id, name, state FROM links").fetchall()
-        return [{"link_id": r["link_id"], "name": r["name"], "state": r["state"]} for r in rows]
+        core: AgentCore = app.state.core
+        snap = core.last_snapshot
+        qoe = snap.qoe if snap and isinstance(snap.qoe, dict) else {}
+        tick = core.last_tick
+        wan = getattr(core, "_wan_iface", None) or "unknown"
+        if snap is None:
+            return []
+        return [
+            {
+                "id": f"wan-{wan}",
+                "name": f"WAN · {wan}",
+                "type": "Ethernet uplink",
+                "rtt": round(float(qoe.get("rtt_ms", 0.0) or 0.0), 2),
+                "loss": round(float(qoe.get("loss_pct", 0.0) or 0.0), 2),
+                "capacity": round(float(snap.capacity_mbps or 0.0), 2),
+                "throughput": round(
+                    float(tick.counters.get("throughput_mbps", 0) or 0) if tick else 0.0, 2
+                ),
+                "state": "active" if snap.capacity_mbps is not None else "unknown",
+            }
+        ]
 
     @app.post("/api/v1/paths/evaluate")
     async def paths_evaluate():
@@ -938,9 +1546,10 @@ def create_app(
     @app.get("/api/v1/metrics/internal")
     async def metrics_internal():
         config: AgentConfig = app.state.config
+        cpu, mem = _process_metrics()
         return {
-            "process_cpu_percent": 0.0,
-            "process_mem_mb": 0.0,
+            "process_cpu_percent": cpu,
+            "process_mem_mb": mem,
             "loop_slow_interval_s": config.slow_interval_s,
             "loop_fast_interval_s": config.fast_interval_s,
         }
@@ -976,15 +1585,23 @@ def create_app(
 
     @app.post("/api/v1/keys/rotate")
     async def rotate_keys():
-        return {"ok": True, "verdict": "keys_rotated"}
+        store: Store = app.state.store
+        key = f"EB-{uuid.uuid4().hex[:4].upper()}-{uuid.uuid4().hex[:4].upper()}-{uuid.uuid4().hex[:4].upper()}"
+        store.execute(
+            "INSERT INTO audit_log(ts, actor, action, target, result, details) VALUES (?, ?, ?, ?, ?, ?)",
+            (time.time(), "owner", "pairing.rotate", "pairing-key", "ok", "{}"),
+        )
+        store.commit()
+        return {"ok": True, "verdict": "keys_rotated", "key": key}
 
     @app.get("/api/v1/audit")
     async def audit():
         store: Store = app.state.store
         rows = store.execute(
-            "SELECT ts, actor, action, target, result, details FROM audit_log ORDER BY ts DESC LIMIT 50"
+            "SELECT id, ts, actor, action, target, result, details FROM audit_log "
+            "ORDER BY ts DESC LIMIT 100"
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [_log_entry(row) for row in rows]
 
     # ------------------------------------------------------------------ dev control
 
@@ -1083,6 +1700,11 @@ if __name__ == "__main__":
     from eb_agent.decision_log import DecisionLog
     from eb_agent.intents import IntentService
 
+    logging.basicConfig(
+        level=os.environ.get("EB_LOG_LEVEL", "info").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
     cmd = sys.argv[1] if len(sys.argv) > 1 else "serve"
     if cmd == "update-check":
         print(json.dumps({"update_available": False, "current_version": APP_VERSION}))
@@ -1117,6 +1739,8 @@ if __name__ == "__main__":
         store,
         host="0.0.0.0",
         port=7443,
+        decision_log=decision_log,
+        intent_service=intent_service,
         health=health,
         negotiation=negotiation,
         experiments=experiments,

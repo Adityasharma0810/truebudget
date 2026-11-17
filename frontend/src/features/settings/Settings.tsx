@@ -117,7 +117,7 @@ export default function Settings() {
           <div className="setting-row">
             <div>
               <h3>Observation interval</h3>
-              <p>Real-agent loop timing. Demo clock is accelerated.</p>
+              <p>Real-agent loop timing. The agent measures at this interval.</p>
             </div>
             <select
               aria-label="Observation interval"
@@ -238,8 +238,8 @@ export default function Settings() {
         </Button>
       </section>
       <div className="page-note">
-        <Info size={13} /> Demo settings persist in this browser only. Nothing changes a real
-        network.
+        <Info size={13} /> Settings persist in the agent's local SQLite store. Monitor-only mode
+        measures and plans; it does not alter a qdisc.
       </div>
     </>
   );

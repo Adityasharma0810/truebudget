@@ -57,7 +57,9 @@ export default function Home() {
   const [boostDevice, setBoostDevice] = useState(s.devices[0]?.id ?? "");
   const tier = useEffectiveTier();
   const active = s.devices.filter((d) => d.flows.length).length;
-  const score = Math.round(s.household.qoe * 100);
+  const householdQoe = s.household.qoe;
+  const score = householdQoe === null ? null : Math.round(householdQoe * 100);
+  const qoeBand = householdQoe === null ? "idle" : score! >= 75 ? "green" : score! >= 50 ? "amber" : "red";
   const activeIntent = intents.find((i) => i.status === "active");
   return (
     <>
@@ -81,12 +83,16 @@ export default function Home() {
           <div className="stat-value-row">
             <div>
               <div className="stat-value">
-                <NumberFlow value={score} animated={tier === "Full" || tier === "Balanced"} />
+                {score === null ? (
+                  <span>—</span>
+                ) : (
+                  <NumberFlow value={score} animated={tier === "Full" || tier === "Balanced"} />
+                )}
                 <span>/100</span>
               </div>
               <div className="stat-note">
-                <QoEBadge band={score >= 75 ? "green" : score >= 50 ? "amber" : "red"} small />
-                <span>QoE proxy</span>
+                <QoEBadge band={qoeBand} small />
+                <span>{score === null ? "No active flows" : "QoE proxy"}</span>
               </div>
             </div>
             <div className="mini-gauge">
@@ -105,17 +111,22 @@ export default function Home() {
                   strokeWidth="7"
                   strokeLinecap="round"
                   initial={{ pathLength: 0 }}
-                  animate={{ pathLength: s.household.qoe }}
+                  animate={{ pathLength: householdQoe ?? 0 }}
                   transition={{ duration: 0.9 }}
                 />
                 <path d="M40 37 L54 22" stroke="#76bd9d" strokeWidth="2" strokeLinecap="round" />
                 <circle cx="40" cy="37" r="3" fill="#38b88b" />
               </svg>
-              <span>Looking good</span>
+              <span>{score === null ? "No traffic yet" : score >= 75 ? "Looking good" : score >= 50 ? "Some congestion" : "Needs attention"}</span>
             </div>
           </div>
           <div className="stat-bottom">
-            <CheckCircle2 size={11} /> Everyone has room to do their thing
+            <CheckCircle2 size={11} />{" "}
+            {score === null
+              ? "Waiting for an active application flow"
+              : score >= 75
+                ? "Everyone has room to do their thing"
+                : "Measured from live latency, jitter and loss"}
           </div>
         </SpotlightCard>
         <SpotlightCard className="stat-card">

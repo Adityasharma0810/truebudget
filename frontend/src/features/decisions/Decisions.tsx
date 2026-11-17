@@ -329,7 +329,7 @@ export default function Decisions() {
       )}
       <div className="page-note">
         <Info size={13} /> Hashes verify local log continuity, not the trustworthiness of a remote
-        agent. All events here are emulated.
+        agent. Monitor-only decisions do not change a qdisc.
       </div>
     </>
   );

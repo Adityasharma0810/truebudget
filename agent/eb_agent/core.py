@@ -16,10 +16,15 @@ synthetic or demo data is generated.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import logging
 import os
 import re
+import socket
+import statistics
+import struct
+import subprocess
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -45,6 +50,159 @@ from eb_agent.store import Store
 logger = logging.getLogger("eb_agent.core")
 
 NET_DEV = "/proc/net/dev"
+SIOCGIFADDR = 0x8915
+
+
+def _interface_ipv4(ifname: str) -> str | None:
+    """Read an interface's IPv4 address without shelling out."""
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        packed = fcntl.ioctl(
+            sock.fileno(), SIOCGIFADDR, struct.pack("256s", ifname[:15].encode("utf-8"))
+        )
+        return ".".join(str(byte) for byte in packed[20:24])
+    except (OSError, ValueError):
+        return None
+    finally:
+        if sock is not None:
+            sock.close()
+
+
+def _interface_mac(ifname: str) -> str | None:
+    try:
+        with open(f"/sys/class/net/{ifname}/address", "r", encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+def _interface_ipv6(ifname: str) -> str | None:
+    """Return the first global IPv6 address assigned to an interface."""
+    try:
+        with open("/proc/net/if_inet6", "r", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 6 or parts[5] != ifname:
+                    continue
+                if parts[3] != "00":  # prefer global scope over link-local
+                    continue
+                packed = bytes.fromhex(parts[0])
+                return socket.inet_ntop(socket.AF_INET6, packed)
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _local_interfaces() -> list[str]:
+    try:
+        names = [
+            name
+            for name in os.listdir("/sys/class/net")
+            if name != "lo" and os.path.isdir(f"/sys/class/net/{name}")
+        ]
+    except OSError:
+        return []
+    return sorted(names)
+
+
+def _read_neighbors() -> list[dict[str, str]]:
+    """Read the kernel IPv4 ARP table (real LAN neighbours)."""
+    neighbors: list[dict[str, str]] = []
+    try:
+        with open("/proc/net/arp", "r", encoding="utf-8") as fh:
+            next(fh, None)
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 6 or parts[3] == "00:00:00:00:00:00":
+                    continue
+                neighbors.append(
+                    {"ip": parts[0], "mac": parts[3].lower(), "ifname": parts[5]}
+                )
+    except OSError:
+        pass
+    return neighbors
+
+
+def _split_endpoint(value: str) -> tuple[str, int]:
+    raw = value.strip()
+    if not raw or raw == "*:*":
+        return "", 0
+    if raw.startswith("["):
+        host, _, port = raw.rpartition("]:")
+        return host.lstrip("["), int(port) if port.isdigit() else 0
+    host, sep, port = raw.rpartition(":")
+    if not sep:
+        return raw, 0
+    host = host.split("%", 1)[0]
+    return host, int(port) if port.isdigit() else 0
+
+
+def _parse_ss_output(text: str, protocol: str) -> list[dict]:
+    """Parse ``ss -tinp`` / ``ss -uinp`` output into socket records."""
+    records: list[dict] = []
+    current: dict | None = None
+
+    def finalize(record: dict | None) -> None:
+        if record is None:
+            return
+        metrics = record.pop("metrics", "")
+        rtt = re.search(r"rtt:([\d.]+)/([\d.]+)", metrics)
+        sent = re.search(r"bytes_sent:(\d+)", metrics)
+        received = re.search(r"bytes_received:(\d+)", metrics)
+        retrans = re.search(r"retrans:\d+/(\d+)", metrics)
+        segs_out = re.search(r"segs_out:(\d+)", metrics)
+        record["rtt_ms"] = float(rtt.group(1)) if rtt else 0.0
+        record["jitter_ms"] = float(rtt.group(2)) if rtt else 0.0
+        record["bytes_sent"] = int(sent.group(1)) if sent else 0
+        record["bytes_received"] = int(received.group(1)) if received else 0
+        record["retransmits"] = int(retrans.group(1)) if retrans else 0
+        record["segs_out"] = int(segs_out.group(1)) if segs_out else 0
+        record["loss_pct"] = (
+            round(record["retransmits"] / record["segs_out"] * 100.0, 3)
+            if record["segs_out"]
+            else 0.0
+        )
+        records.append(record)
+
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if line[0].isspace():
+            if current is not None:
+                current["metrics"] += " " + line.strip()
+            continue
+        finalize(current)
+        current = None
+        parts = line.split(None, 5)
+        if len(parts) < 5:
+            continue
+        state, recv_q, send_q, local, peer = parts[:5]
+        if state != "ESTAB":
+            continue
+        src_ip, src_port = _split_endpoint(local)
+        dst_ip, dst_port = _split_endpoint(peer)
+        process = ""
+        if len(parts) > 5:
+            match = re.search(r'users:\(\("([^"]+)"', parts[5])
+            if match:
+                process = match.group(1)
+        current = {
+            "protocol": protocol,
+            "state": state,
+            "recv_q": int(recv_q) if recv_q.isdigit() else 0,
+            "send_q": int(send_q) if send_q.isdigit() else 0,
+            "src_ip": src_ip,
+            "src_port": src_port,
+            "dst_ip": dst_ip,
+            "dst_port": dst_port,
+            "process": process,
+            "metrics": "",
+        }
+    finalize(current)
+    return records
+
+
 
 
 def request_id() -> str:
@@ -154,6 +312,15 @@ class AgentCore:
         self._last_tx_bytes: int | None = None
         self._last_probe_ts: float | None = None
         self._flow_id_counter = 0
+        self._socket_samples: dict[str, tuple[float, int, float]] = {}
+        self._conntrack_samples: dict[str, tuple[float, int, float]] = {}
+        self._last_throughput_mbps = 0.0
+        self._last_slow_ms = 0.0
+        self._last_quality = (0.0, 0.0, 0.0)
+        self._last_queue_pkts = 0
+        self._last_policy_signature: tuple | None = None
+        self._last_policy_qoe: float | None = None
+        self._last_policy_capacity: float | None = None
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -203,11 +370,12 @@ class AgentCore:
     async def _slow_tick(self) -> None:
         rid = request_id()
         now = time.time()
+        started = time.monotonic()
 
-        # 1. Discover/refresh devices (from store only -- no hardcoded defaults).
-        devices = self._discover_devices()
+        # 1. Discover/refresh devices from real kernel state (interfaces + ARP).
+        devices = self._refresh_devices()
 
-        # 2. Gather real flow features (from store + conntrack) and classify.
+        # 2. Gather real flow features (from sockets + conntrack) and classify.
         flows = self._gather_and_classify_flows(devices)
 
         # 3. Estimate link capacity (Kalman) from real interface throughput probes.
@@ -218,6 +386,7 @@ class AgentCore:
 
         # 5. Run max-min policy over active intents + floors.
         policy = self._run_policy(flows, estimate, qoe)
+        self._record_policy_decision(policy, qoe, estimate)
 
         # 6. Expire overdue intents.
         active_intents = self._refresh_intents(now)
@@ -240,12 +409,18 @@ class AgentCore:
         self._persist_flows(flows)
         self._persist_qoe(qoe)
         self._persist_capacity(estimate, now)
+        self._persist_link_metrics(qoe, now)
+        self._last_slow_ms = (time.monotonic() - started) * 1000.0
         if self.on_snapshot:
             result = self.on_snapshot(snapshot)
             if asyncio.iscoroutine(result):
                 await result
         logger.info(
-            "slow tick",
+            "slow tick: %d devices, %d flows, %.2f Mbps capacity, %.1f ms rtt",
+            len(snapshot.devices),
+            len(snapshot.flows),
+            snapshot.capacity_mbps or 0.0,
+            float(qoe.get("rtt_ms", 0.0) or 0.0),
             extra={
                 "request_id": rid,
                 "ts": snapshot.ts,
@@ -291,7 +466,8 @@ class AgentCore:
             emulated=self.emulated,
         )
         self._last_tick = tick
-        self._persist_metrics_raw(now, sample_mbps)
+        self._last_throughput_mbps = sample_mbps
+        self._persist_metrics_raw(now, "throughput_mbps", sample_mbps, "wan")
         if self.on_tick:
             result = self.on_tick(tick)
             if asyncio.iscoroutine(result):
@@ -308,86 +484,215 @@ class AgentCore:
 
     # ------------------------------------------------------------------ real data sources
 
-    def _discover_devices(self) -> list[dict]:
-        """Return known devices from the store only.  No hardcoded defaults."""
+    def _refresh_devices(self) -> list[dict]:
+        """Discover real devices on this host/LAN and persist them.
+
+        Sources: local interfaces (this host) and the kernel ARP/neighbour
+        table (other LAN hosts).  The default gateway is the router, not a
+        household endpoint, so it is not reported as a device.  No names are
+        invented: a new device is named after its address until the user
+        renames it.
+        """
+        now = time.time()
+        host_ips: set[str] = set()
+        gateway = self._default_gateway()
+        for ifname in _local_interfaces():
+            ipv4 = _interface_ipv4(ifname)
+            if not ipv4:
+                continue
+            host_ips.add(ipv4)
+            ipv6 = _interface_ipv6(ifname)
+            if ipv6:
+                host_ips.add(ipv6)
+            mac = _interface_mac(ifname)
+            device_id = f"host-{ifname}"
+            self.store.execute(
+                "INSERT INTO devices(device_id, name, mac, ipv4, ipv6, assigned_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(device_id) DO UPDATE SET mac=excluded.mac, ipv4=excluded.ipv4, "
+                "ipv6=excluded.ipv6",
+                (device_id, f"This host · {ifname}", mac, ipv4, ipv6, now),
+            )
+        for neighbor in _read_neighbors():
+            ipv4 = neighbor["ip"]
+            mac = neighbor["mac"]
+            if ipv4 in host_ips or ipv4 == gateway:
+                continue
+            if ipv4.startswith("169.254."):
+                continue
+            device_id = f"dev-{mac.replace(':', '')}"
+            self.store.execute(
+                "INSERT INTO devices(device_id, name, mac, ipv4, ipv6, assigned_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(device_id) DO UPDATE SET mac=excluded.mac, ipv4=excluded.ipv4",
+                (device_id, f"Device {ipv4}", mac, ipv4, None, now),
+            )
+        self.store.commit()
         rows = self.store.execute(
             "SELECT device_id, name, mac, ipv4, ipv6, assigned_at FROM devices ORDER BY assigned_at"
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def _gather_and_classify_flows(self, devices: list[dict]) -> list[dict]:
-        """Gather real flow features from conntrack + store, then classify each flow."""
+    def _read_socket_flows(self) -> tuple[list[dict], int]:
+        """Read real per-socket byte counters and RTT from ``ss``.
 
-        device_ids = [d["device_id"] for d in devices]
-        flows: list[dict] = []
-        now = time.time()
-
-        # Read active connections from conntrack (real flows on this gateway).
-        conntrack_flows = self._read_conntrack_flows()
-
-        # Also include flows persisted in the store from previous ticks.
-        stored_flow_ids: set[str] = set()
-        if device_ids:
-            placeholders = ",".join("?" for _ in device_ids)
-            rows = self.store.execute(
-                f"SELECT flow_id, device_id, class, src_ip, dst_ip, src_port, dst_port, "
-                f"protocol, last_seen FROM flows WHERE device_id IN ({placeholders})",
-                tuple(device_ids),
-            ).fetchall()
-            for row in rows:
-                stored_flow_ids.add(row["flow_id"])
-                flows.append({
-                    "flow_id": row["flow_id"],
-                    "device_id": row["device_id"],
-                    "traffic_class": row["class"],
-                    "confidence": 0.9,
-                    "method": "stored",
-                    "src_ip": row["src_ip"],
-                    "dst_ip": row["dst_ip"],
-                    "src_port": row["src_port"],
-                    "dst_port": row["dst_port"],
-                    "protocol": row["protocol"],
-                    "bytes_per_s": 0.0,
-                    "first_seen": row["last_seen"],
-                    "last_seen": row["last_seen"],
-                })
-
-        # Add new conntrack flows not already in the store.
-        self._flow_id_counter += 1
-        for index, cf in enumerate(conntrack_flows):
-            flow_id = f"flow-{int(now * 1000)}-{index}"
-            if flow_id in stored_flow_ids:
+        Works without root on Linux and gives per-connection throughput,
+        retransmits and RTT for flows owned by this host.  Returns the raw
+        records plus the number of packets currently queued in send buffers.
+        """
+        records: list[dict] = []
+        for args, protocol in ((["ss", "-tinp"], "tcp"), (["ss", "-uinp"], "udp")):
+            try:
+                result = subprocess.run(
+                    args, capture_output=True, text=True, timeout=5, check=False
+                )
+            except (OSError, subprocess.TimeoutExpired):
                 continue
-            device_id = self._device_for_ip(cf["src_ip"], devices)
+            if result.returncode == 0:
+                records.extend(_parse_ss_output(result.stdout, protocol))
+
+        now = time.time()
+        flows: list[dict] = []
+        queue_pkts = 0
+        active_ids: set[str] = set()
+        for record in records:
+            src_ip = record.get("src_ip", "")
+            dst_ip = record.get("dst_ip", "")
+            if not src_ip or not dst_ip:
+                continue
+            if src_ip.startswith("127.") or dst_ip.startswith("127."):
+                continue
+            if dst_ip.startswith("169.254.") or dst_ip.startswith("fe80:"):
+                continue
+            queue_pkts += int(record.get("send_q", 0)) + int(record.get("recv_q", 0))
+            flow_id = (
+                f"sock-{record['protocol']}-{src_ip}:{record.get('src_port', 0)}"
+                f"-{dst_ip}:{record.get('dst_port', 0)}"
+            )
+            active_ids.add(flow_id)
+            total = int(record.get("bytes_sent", 0)) + int(record.get("bytes_received", 0))
+            previous = self._socket_samples.get(flow_id)
+            if previous:
+                delta = max(0, total - previous[1])
+                elapsed = max(0.001, now - previous[0])
+                bytes_per_s = delta / elapsed
+                first_seen = previous[2]
+                # A byte counter can reset if a socket tuple is reused.
+                if total < previous[1]:
+                    bytes_per_s = 0.0
+            else:
+                bytes_per_s = 0.0
+                first_seen = now
+            self._socket_samples[flow_id] = (now, total, first_seen)
+            sent = int(record.get("bytes_sent", 0))
+            received = int(record.get("bytes_received", 0))
+            direction_ratio = sent / (sent + received) if (sent + received) else 0.5
+            flows.append(
+                {
+                    "flow_id": flow_id,
+                    "src_ip": src_ip,
+                    "dst_ip": dst_ip,
+                    "src_port": record.get("src_port"),
+                    "dst_port": record.get("dst_port"),
+                    "protocol": record["protocol"],
+                    "process": record.get("process") or "",
+                    "bytes_per_s": bytes_per_s,
+                    "bytes_sent": sent,
+                    "bytes_received": received,
+                    "rtt_ms": float(record.get("rtt_ms", 0.0) or 0.0),
+                    "jitter_ms": float(record.get("jitter_ms", 0.0) or 0.0),
+                    "loss_pct": float(record.get("loss_pct", 0.0) or 0.0),
+                    "retransmits": int(record.get("retransmits", 0) or 0),
+                    "direction_ratio": direction_ratio,
+                    "duration_s": max(1.0, now - first_seen),
+                    "first_seen": first_seen,
+                    "last_seen": now,
+                }
+            )
+        for flow_id in list(self._socket_samples):
+            if flow_id not in active_ids:
+                del self._socket_samples[flow_id]
+        self._last_queue_pkts = queue_pkts
+        return flows, queue_pkts
+
+
+    def _gather_and_classify_flows(self, devices: list[dict]) -> list[dict]:
+        """Gather real flow features from sockets + conntrack, then classify."""
+        now = time.time()
+        candidates: list[dict] = []
+
+        # Per-socket measurements (works for traffic owned by this host).
+        socket_flows, _queue = self._read_socket_flows()
+        candidates.extend(socket_flows)
+
+        # Kernel connection tracking (gateway/bridge mode, when readable).
+        for cf in self._read_conntrack_flows():
+            flow_id = (
+                f"ct-{cf.get('protocol', 'tcp')}-{cf.get('src_ip')}:{cf.get('src_port')}"
+                f"-{cf.get('dst_ip')}:{cf.get('dst_port')}"
+            )
+            total = int(cf.get("bytes", 0) or 0)
+            previous = self._conntrack_samples.get(flow_id)
+            if previous:
+                elapsed = max(0.001, now - previous[0])
+                bytes_per_s = max(0, total - previous[1]) / elapsed
+                first_seen = previous[2]
+            else:
+                bytes_per_s = 0.0
+                first_seen = now
+            self._conntrack_samples[flow_id] = (now, total, first_seen)
+            cf.update(
+                {
+                    "flow_id": flow_id,
+                    "bytes_per_s": bytes_per_s,
+                    "duration_s": max(1.0, now - first_seen),
+                    "first_seen": first_seen,
+                    "last_seen": now,
+                    "direction_ratio": 0.5,
+                    "rtt_ms": 0.0,
+                    "jitter_ms": 0.0,
+                    "loss_pct": 0.0,
+                    "retransmits": 0,
+                    "bytes_sent": 0,
+                    "bytes_received": 0,
+                    "process": "",
+                }
+            )
+            candidates.append(cf)
+
+        flows: list[dict] = []
+        seen: set[str] = set()
+        for cf in candidates:
+            flow_id = str(cf.get("flow_id", ""))
+            if not flow_id or flow_id in seen:
+                continue
+            seen.add(flow_id)
+            device_id = self._device_for_ip(str(cf.get("src_ip", "")), devices)
+            if not device_id:
+                continue
             features = {
                 "protocol": cf.get("protocol", "tcp"),
                 "dst_port": cf.get("dst_port"),
                 "src_port": cf.get("src_port"),
-                "direction_ratio": 0.5,
-                "bytes_per_s": float(cf.get("bytes_per_s", 0) or 0),
-                "duration_s": float(cf.get("duration_s", 1) or 1),
-                "burstiness": float(cf.get("burstiness", 0) or 0),
-                "pkt_len_mean": float(cf.get("pkt_len_mean", 0) or 0),
-                "iat_mean": float(cf.get("iat_mean", 10) or 10),
+                "direction_ratio": float(cf.get("direction_ratio", 0.5)),
+                "bytes_per_s": float(cf.get("bytes_per_s", 0.0)),
+                "duration_s": float(cf.get("duration_s", 1.0)),
+                "burstiness": float(cf.get("burstiness", 0.0) or 0.0),
+                "pkt_len_mean": float(cf.get("pkt_len_mean", 0.0) or 0.0),
+                "iat_mean": float(cf.get("iat_mean", 10.0) or 10.0),
             }
             result: ClassifierResult = self.classifier.predict(features)
-            flow = {
-                "flow_id": flow_id,
-                "device_id": device_id or (device_ids[0] if device_ids else "unknown"),
-                "traffic_class": result.predicted_class,
-                "confidence": result.confidence,
-                "method": result.method,
-                "src_ip": cf.get("src_ip"),
-                "dst_ip": cf.get("dst_ip"),
-                "src_port": cf.get("src_port"),
-                "dst_port": cf.get("dst_port"),
-                "protocol": cf.get("protocol", "tcp"),
-                "bytes_per_s": features["bytes_per_s"],
-                "first_seen": now,
-                "last_seen": now,
-            }
-            flows.append(flow)
-
+            flows.append(
+                {
+                    **cf,
+                    "flow_id": flow_id,
+                    "device_id": device_id,
+                    "traffic_class": result.predicted_class,
+                    "confidence": result.confidence,
+                    "method": result.method,
+                    "bytes_per_s": features["bytes_per_s"],
+                }
+            )
         return flows
 
     def _read_conntrack_flows(self) -> list[dict]:
@@ -440,9 +745,9 @@ class AgentCore:
         }
 
     def _device_for_ip(self, ip: str, devices: list[dict]) -> str | None:
-        """Match a source IP to a known device."""
+        """Match a source IP (IPv4 or IPv6) to a known device."""
         for d in devices:
-            if d.get("ipv4") == ip:
+            if d.get("ipv4") == ip or d.get("ipv6") == ip:
                 return d["device_id"]
         return None
 
@@ -485,8 +790,19 @@ class AgentCore:
     ) -> dict[str, object]:
         """Compute per-device QoE from real measurements (RTT/jitter/throughput)."""
 
-        # Measure real RTT via ping to a well-known target.
         rtt_ms, jitter_ms, loss_pct = self._probe_network_quality()
+        self._last_quality = (rtt_ms, jitter_ms, loss_pct)
+
+        # Prefer per-flow RTT from the kernel when available (ss reports it).
+        flow_rtts = [float(f.get("rtt_ms", 0.0)) for f in flows if f.get("rtt_ms")]
+        flow_jitters = [float(f.get("jitter_ms", 0.0)) for f in flows if f.get("jitter_ms")]
+        if flow_rtts:
+            rtt_ms = float(statistics.median(flow_rtts))
+        if flow_jitters:
+            jitter_ms = float(statistics.median(flow_jitters))
+        flow_losses = [float(f.get("loss_pct", 0.0)) for f in flows if f.get("segs_out")]
+        if flow_losses:
+            loss_pct = float(statistics.median(flow_losses))
 
         device_qoes: dict[str, dict] = {}
         flow_qoes: list[dict] = []
@@ -498,26 +814,41 @@ class AgentCore:
                 tc = f["traffic_class"]
                 rate = f.get("bytes_per_s", 0) / 1_000_000.0
                 capacity = estimate.capacity_mbps if estimate else 100.0
+                flow_rtt = float(f.get("rtt_ms", 0.0) or rtt_ms)
+                flow_jitter = float(f.get("jitter_ms", 0.0) or jitter_ms)
+                flow_loss = float(f.get("loss_pct", 0.0) or loss_pct)
+                score: float | None
+                method = tc
                 if tc == "call":
-                    score = call_qoe(rtt_ms=rtt_ms, jitter_ms=jitter_ms, loss_pct=loss_pct)
+                    score = call_qoe(rtt_ms=flow_rtt, jitter_ms=flow_jitter, loss_pct=flow_loss)
                 elif tc == "game":
-                    score = game_qoe(rtt_ms=rtt_ms, jitter_ms=jitter_ms, loss_pct=loss_pct)
+                    score = game_qoe(rtt_ms=flow_rtt, jitter_ms=flow_jitter, loss_pct=flow_loss)
                 elif tc == "stream":
-                    score = stream_qoe(
-                        throughput_mbps=rate,
-                        target_bitrate_mbps=6.0,
-                        cov=0.1,
-                        rebuffer_fraction=0.0,
+                    score = (
+                        stream_qoe(
+                            throughput_mbps=rate,
+                            target_bitrate_mbps=6.0,
+                            cov=0.1,
+                            rebuffer_fraction=0.0,
+                        )
+                        if rate > 0
+                        else None
                     )
-                    score = score if score is not None else 0.0
                 elif tc == "bulk":
-                    score = bulk_qoe(
-                        rate_mbps=rate,
-                        fair_expected_mbps=capacity / max(1, len(dev_flows)),
+                    score = (
+                        bulk_qoe(
+                            rate_mbps=rate,
+                            fair_expected_mbps=capacity / max(1, len(dev_flows)),
+                        )
+                        if rate > 0
+                        else None
                     )
-                    score = score if score is not None else 0.0
                 else:
-                    score = None
+                    # Unknown traffic still has a measured responsiveness.
+                    # Use the game/RTT formula as a transparent proxy rather
+                    # than guessing a class.
+                    score = game_qoe(rtt_ms=flow_rtt, jitter_ms=flow_jitter, loss_pct=flow_loss)
+                    method = "responsiveness_proxy"
                 flow_qoes.append(
                     {
                         "flow_id": f["flow_id"],
@@ -525,7 +856,9 @@ class AgentCore:
                         "traffic_class": tc,
                         "qoe": score,
                         "band": qoe_band(score),
-                        "confidence": f.get("confidence", 0.5),
+                        "confidence": f.get("confidence", 0.0),
+                        "method": method,
+                        "bytes_per_s": f.get("bytes_per_s", 0.0),
                     }
                 )
                 if score is not None:
@@ -547,6 +880,8 @@ class AgentCore:
             "rtt_ms": rtt_ms,
             "jitter_ms": jitter_ms,
             "loss_pct": loss_pct,
+            "queue_pkts": self._last_queue_pkts,
+            "throughput_mbps": self._last_throughput_mbps,
         }
 
     def _probe_network_quality(self) -> tuple[float, float, float]:
@@ -658,6 +993,63 @@ class AgentCore:
             ],
         }
 
+    def _record_policy_decision(self, policy: dict, qoe: dict, estimate) -> None:
+        """Record a real policy recomputation in the hash-chained log.
+
+        The daemon runs in monitor mode: it computes allocations from measured
+        demand but does not alter a qdisc.  The decision evidence says so, so
+        the log never implies a network change that did not happen.
+        """
+        if not self.decision_log:
+            return
+        allocations = {
+            str(a.get("flow_id")): round(float(a.get("rate_mbps", 0.0)), 3)
+            for a in policy.get("allocations", [])
+            if a.get("flow_id")
+        }
+        signature = tuple(sorted(allocations.items()))
+        current_qoe = qoe.get("household")
+        current_qoe = float(current_qoe) if isinstance(current_qoe, (int, float)) else None
+        capacity = float(estimate.capacity_mbps) if estimate else 0.0
+        if signature == self._last_policy_signature:
+            return
+        initial = self._last_policy_signature is None
+        before = {
+            "qoe": self._last_policy_qoe if self._last_policy_qoe is not None else (current_qoe or 0.0),
+            "capacity": self._last_policy_capacity if self._last_policy_capacity is not None else capacity,
+        }
+        after = {
+            "qoe": current_qoe or 0.0,
+            "capacity": capacity,
+        }
+        if not allocations and initial:
+            self._last_policy_signature = signature
+            return
+        self.decision_log.append(
+            trigger="policy.baseline" if initial else "policy.recompute",
+            reason=(
+                "Initial max-min allocation computed from measured demand. "
+                "Monitor-only: no qdisc was changed."
+                if initial
+                else "Allocation recomputed after demand changed. "
+                "Monitor-only: no qdisc was changed."
+            ),
+            before_qoe=before,
+            after_qoe=after,
+            evidence={
+                "mode": "monitor-only",
+                "allocations": allocations,
+                "rationale": policy.get("rationale", ""),
+                "jain": qoe.get("jain"),
+                "rtt_ms": qoe.get("rtt_ms"),
+                "loss_pct": qoe.get("loss_pct"),
+            },
+            verdict="kept",
+        )
+        self._last_policy_signature = signature
+        self._last_policy_qoe = current_qoe
+        self._last_policy_capacity = capacity
+
     def _refresh_intents(self, now: float) -> list[dict]:
         if not self.intent_service:
             return []
@@ -680,7 +1072,8 @@ class AgentCore:
 
     def _persist_snapshot(self, snapshot: Snapshot) -> None:
         self.store.execute(
-            "INSERT INTO settings(key, value, updated_at) VALUES (?, ?, ?)",
+            "INSERT INTO settings(key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
             ("last_snapshot", json.dumps({"ts": snapshot.ts, "mode": snapshot.mode}), snapshot.ts),
         )
         self.store.commit()
@@ -738,12 +1131,32 @@ class AgentCore:
         )
         self.store.commit()
 
-    def _persist_metrics_raw(self, now: float, value: float) -> None:
+    def _persist_metrics_raw(
+        self, now: float, metric: str, value: float, device_id: str = "gateway"
+    ) -> None:
         self.store.execute(
             "INSERT INTO metrics_raw(ts, device_id, flow_id, metric, value, source) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (now, "gateway", "wan", "throughput_mbps", float(value), "proc_net_dev"),
+            (now, device_id, "wan", metric, float(value), "proc_net_dev"),
         )
+        self.store.commit()
+
+    def _persist_link_metrics(self, qoe: dict, now: float) -> None:
+        for metric, value, source in (
+            ("latency_ms", qoe.get("rtt_ms", 0.0), "ping"),
+            ("jitter_ms", qoe.get("jitter_ms", 0.0), "ping"),
+            ("loss_pct", qoe.get("loss_pct", 0.0), "ping"),
+            ("queue_pkts", qoe.get("queue_pkts", 0), "ss"),
+            ("fairness", qoe.get("jain", 1.0), "qoe"),
+        ):
+            if value is None:
+                continue
+            self.store.execute(
+                "INSERT INTO metrics_raw(ts, device_id, flow_id, metric, value, source) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (now, "gateway", "wan", metric, float(value), source),
+            )
+        self.store.commit()
 
     # ------------------------------------------------------------------ public accessors
 

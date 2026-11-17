@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { motion } from "motion/react";
 import {
@@ -42,7 +42,12 @@ export default function Intent() {
   const cancel = useTask("Boost cancelled. Normal allocation restored.");
   const active = intents.filter((i) => i.status === "active" || i.status === "infeasible");
   const previous = intents.filter((i) => i.status !== "active" && i.status !== "infeasible");
-  const target = snapshot.devices.find((d) => d.id === device)!;
+  const target = snapshot.devices.find((d) => d.id === device) ?? snapshot.devices[0];
+  useEffect(() => {
+    if (!snapshot.devices.some((d) => d.id === device)) {
+      setDevice(snapshot.devices[0]?.id ?? "");
+    }
+  }, [snapshot.devices, device]);
   function submit(e: React.FormEvent) {
     e.preventDefault();
     task.mutate({
@@ -57,6 +62,22 @@ export default function Intent() {
         minServiceFloor: true,
       },
     });
+  }
+  if (!target) {
+    return (
+      <>
+        <SectionHeading
+          title="A little priority. A better moment."
+          description="Tell your network what matters now. We’ll make room, then return to normal."
+        />
+        <div className="card">
+          <EmptyState
+            title="No devices discovered yet."
+            description="Intents can target a device once the agent sees a local interface or a LAN neighbour."
+          />
+        </div>
+      </>
+    );
   }
   return (
     <>

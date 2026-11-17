@@ -198,10 +198,10 @@ export function Health() {
           <HeartPulse size={27} />
         </span>
         <div>
-          <h2>A little congestion. Nothing left unexplained.</h2>
+          <h2>Measured signals, explained.</h2>
           <p>
-            These emulated hypotheses describe a synthetic evening slowdown. No real network
-            diagnosis is being performed.
+            These hypotheses are ranked from the agent's live latency, jitter, loss and QoE
+            measurements. Diagnosis is observation-only; no network change is made.
           </p>
         </div>
         <Badge tone="blue">Observation only</Badge>
@@ -528,7 +528,7 @@ export function Agent() {
               agent: info.data,
               audit: audit.data,
               logs: logs.data,
-              warning: "Emulated diagnostic export. No pairing keys included.",
+              warning: "Local diagnostic export. No pairing keys included.",
             })
           }
         >
@@ -548,7 +548,9 @@ export function Agent() {
             <div>
               <div className="row-between">
                 <h2>{info.data.hostname}</h2>
-                <Badge tone="emulated">Emulated agent</Badge>
+                <Badge tone={info.data.emulated ? "emulated" : "blue"}>
+                  {info.data.emulated ? "Emulated agent" : "Live agent"}
+                </Badge>
               </div>
               <p>
                 {info.data.os} <span>·</span> v{info.data.version}
@@ -564,7 +566,7 @@ export function Agent() {
                   Local DB <strong>{info.data.dbSize}</strong>
                 </span>
                 <span>
-                  Demo seed <strong>{info.data.seed}</strong>
+                  Random seed <strong>{info.data.seed || "—"}</strong>
                 </span>
               </div>
             </div>

@@ -26,7 +26,7 @@ import {
 import { percent } from "../../lib/format";
 export default function ML() {
   const { data, error, refetch } = useApi<MLData>("/ml/metrics");
-  const task = useTask("Model operation completed. Metrics are emulated.");
+  const task = useTask("Model request completed. See the returned status.");
   const correction = useTask("Correction reviewed.");
   const [cell, setCell] = useState<string | null>(null);
   if (error) return <ErrorState message={error.message} retry={() => void refetch()} />;
@@ -55,7 +55,10 @@ export default function ML() {
           {
             title: "Classifier accuracy",
             value: data.accuracy,
-            desc: "vs port-rule baseline " + percent(data.baseline),
+            desc:
+              data.baseline === null
+                ? "no labelled baseline yet"
+                : "vs port-rule baseline " + percent(data.baseline),
           },
           { title: "Macro F1 score", value: data.f1, desc: "All five classes, including unknown" },
           {
@@ -66,9 +69,9 @@ export default function ML() {
         ].map((m) => (
           <section className="card ml-stat" key={m.title}>
             <span>{m.title}</span>
-            <strong>{percent(m.value)}</strong>
+            <strong>{m.value === null ? "Unknown" : percent(m.value)}</strong>
             <p>{m.desc}</p>
-            <ProgressBar value={m.value} />
+            {m.value !== null && <ProgressBar value={m.value} />}
           </section>
         ))}
       </div>
@@ -78,41 +81,52 @@ export default function ML() {
             title="Where the classifier gets it right"
             subtitle="Rows: actual class · Columns: predicted class"
           />
-          <div className="confusion-matrix">
-            <div />
-            {data.labels.map((l) => (
-              <div key={l} className="matrix-label">
-                {l}
-              </div>
-            ))}
-            {data.matrix.map((row, i) => (
-              <div className="matrix-row" key={i}>
-                <div className="matrix-label">{data.labels[i]}</div>
-                {row.map((v, j) => (
-                  <motion.button
-                    key={j}
-                    initial={{ opacity: 0, scale: 0.9 }}
-                    animate={{ opacity: 1, scale: 1 }}
-                    transition={{ delay: (i * 5 + j) * 0.015 }}
-                    onClick={() => setCell(`${data.labels[i]} → ${data.labels[j]}: ${v} samples`)}
-                    title={`${data.labels[i]} predicted as ${data.labels[j]}: ${v}`}
-                    style={{
-                      background: `rgba(88,130,228,${0.06 + (v / 1000) * 0.62})`,
+          {data.labels.length === 0 || data.matrix.length === 0 ? (
+            <EmptyState
+              title="No labelled evaluation yet."
+              description="The classifier is running its rule baseline. A confusion matrix appears after a real local model has been trained and evaluated."
+            />
+          ) : (
+            <>
+              <div className="confusion-matrix">
+                <div />
+                {data.labels.map((l) => (
+                  <div key={l} className="matrix-label">
+                    {l}
+                  </div>
+                ))}
+                {data.matrix.map((row, i) => (
+                  <div className="matrix-row" key={i}>
+                    <div className="matrix-label">{data.labels[i]}</div>
+                    {row.map((v, j) => (
+                      <motion.button
+                        key={j}
+                        initial={{ opacity: 0, scale: 0.9 }}
+                        animate={{ opacity: 1, scale: 1 }}
+                        transition={{ delay: (i * 5 + j) * 0.015 }}
+                        onClick={() =>
+                          setCell(`${data.labels[i]} → ${data.labels[j]}: ${v} samples`)
+                        }
+                        title={`${data.labels[i]} predicted as ${data.labels[j]}: ${v}`}
+                        style={{
+                          background: `rgba(88,130,228,${0.06 + (v / 1000) * 0.62})`,
                           color: "#142d58",
-                    }}
-                  >
-                    {v}
-                  </motion.button>
+                        }}
+                      >
+                        {v}
+                      </motion.button>
+                    ))}
+                  </div>
                 ))}
               </div>
-            ))}
-          </div>
-          <div className="matrix-footer">
-            <span>{cell ?? "Select a cell to inspect the sample count."}</span>
-            <span>
-              Low <i /> High
-            </span>
-          </div>
+              <div className="matrix-footer">
+                <span>{cell ?? "Select a cell to inspect the sample count."}</span>
+                <span>
+                  Low <i /> High
+                </span>
+              </div>
+            </>
+          )}
         </section>
         <section className="card review-card">
           <CardHeader
@@ -193,27 +207,34 @@ export default function ML() {
           subtitle="Model history stays local. No payload data leaves the agent."
         />
         <div className="model-versions">
-          {data.models.map((m) => (
-            <div key={m.version}>
-              <span className={`model-point ${m.status === "active" ? "model-active" : ""}`}>
-                <BrainCircuit size={19} />
-              </span>
-              <div>
-                <h3>
-                  {m.version}{" "}
-                  <Badge tone={m.status === "active" ? "blue" : "neutral"}>{m.status}</Badge>
-                </h3>
-                <p>
-                  {m.date} · {percent(m.accuracy)} accuracy
-                </p>
+          {data.models.length === 0 ? (
+            <EmptyState
+              title="No local model yet."
+              description="The classifier is using its rule baseline. A version appears here only after a real local training run."
+            />
+          ) : (
+            data.models.map((m) => (
+              <div key={m.version}>
+                <span className={`model-point ${m.status === "active" ? "model-active" : ""}`}>
+                  <BrainCircuit size={19} />
+                </span>
+                <div>
+                  <h3>
+                    {m.version}{" "}
+                    <Badge tone={m.status === "active" ? "blue" : "neutral"}>{m.status}</Badge>
+                  </h3>
+                  <p>
+                    {m.date} · {m.accuracy === null ? "unknown" : percent(m.accuracy)} accuracy
+                  </p>
+                </div>
               </div>
-            </div>
-          ))}
+            ))
+          )}
         </div>
       </section>
       <div className="page-note">
-        <Info size={13} /> All model metrics are fixtures. Retrain and rollback emulate a lifecycle;
-        this browser does not run a real training job or degradation predictor.
+        <Info size={13} /> Model versions are read from the agent's local database. Retrain and
+        rollback are refused until a real training job exists; no synthetic model metrics are shown.
       </div>
     </>
   );

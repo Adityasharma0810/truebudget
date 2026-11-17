@@ -62,10 +62,34 @@ export function useAction<T = unknown>(path: string, method = "POST") {
 export function useSnapshot() {
   const client = useQueryClient();
   const query = useApi<Snapshot>("/state/snapshot", { refetchInterval: 3000 });
-  useEffect(
-    () =>
-      transport.subscribe("snapshot", (value: unknown) => client.setQueryData(["/state/snapshot"], value)),
-    [client],
-  );
+  useEffect(() => {
+    const unsubscribeSnapshot = transport.subscribe("snapshot", (value: unknown) =>
+      client.setQueryData(["/state/snapshot"], value),
+    );
+    const unsubscribeTick = transport.subscribe("tick", (value: unknown) => {
+      const counters = (value as { counters?: Record<string, unknown> } | null)?.counters;
+      if (!counters) return;
+      const throughput = Number(counters.throughput_mbps);
+      const capacity = Number(counters.capacity_mbps);
+      client.setQueryData<Snapshot>(["/state/snapshot"], (old) => {
+        if (!old) return old;
+        return {
+          ...old,
+          link: {
+            ...old.link,
+            capacityMbps: Number.isFinite(capacity) ? capacity : old.link.capacityMbps,
+          },
+          metrics: {
+            ...old.metrics,
+            throughputMbps: Number.isFinite(throughput) ? throughput : old.metrics.throughputMbps,
+          },
+        };
+      });
+    });
+    return () => {
+      unsubscribeSnapshot();
+      unsubscribeTick();
+    };
+  }, [client]);
   return query;
 }

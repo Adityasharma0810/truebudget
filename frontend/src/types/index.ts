@@ -52,7 +52,7 @@ export const SnapshotSchema = z.object({
     forecastConfidence: z.number(),
   }),
   household: z.object({
-    qoe: z.number(),
+    qoe: z.number().nullable(),
     fairness: z.number(),
     worstDeviceId: z.string().nullable(),
   }),
@@ -215,13 +215,13 @@ export interface Correction {
   status: string;
 }
 export interface MLData {
-  accuracy: number;
-  f1: number;
-  baseline: number;
-  encrypted: number;
+  accuracy: number | null;
+  f1: number | null;
+  baseline: number | null;
+  encrypted: number | null;
   matrix: number[][];
   labels: string[];
-  models: { version: string; status: string; accuracy: number; date: string }[];
+  models: { version: string; status: string; accuracy: number | null; date: string }[];
   corrections: Correction[];
 }
 export interface AgentInfo {

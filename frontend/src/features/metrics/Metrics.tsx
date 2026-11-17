@@ -53,7 +53,7 @@ export default function Metrics() {
     <>
       <SectionHeading
         title="A clearer picture, in real time."
-        description="Actual emulated observations, smoothly connected. No invented intermediate samples."
+        description="Live measurements from the kernel and network probes. No invented intermediate samples."
       >
         <Button
           variant="secondary"
