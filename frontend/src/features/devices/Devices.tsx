@@ -223,8 +223,13 @@ export default function Devices() {
         <form
           onSubmit={(e) => {
             e.preventDefault();
+            if (!edit) return;
             task.mutate(
-              { path: "/devices", method: "PATCH", body: { id: edit?.id, name, person } },
+              {
+                path: `/devices/${encodeURIComponent(edit.id)}`,
+                method: "PATCH",
+                body: { name, person },
+              },
               { onSuccess: () => setEdit(null) },
             );
           }}
@@ -238,8 +243,7 @@ export default function Devices() {
             <input value={person} maxLength={40} onChange={(e) => setPerson(e.target.value)} />
           </label>
           <p className="field-hint">
-            Names are stored locally by the emulated agent. Network addresses stay masked in the
-            console.
+            Names are stored locally by the agent. Network addresses stay masked in the console.
           </p>
           <div className="modal-footer">
             <Button variant="secondary" type="button" onClick={() => setEdit(null)}>

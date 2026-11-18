@@ -812,7 +812,7 @@ class AgentCore:
             scores: list[tuple[float, float]] = []
             for f in dev_flows:
                 tc = f["traffic_class"]
-                rate = f.get("bytes_per_s", 0) / 1_000_000.0
+                rate = f.get("bytes_per_s", 0) * 8.0 / 1_000_000.0
                 capacity = estimate.capacity_mbps if estimate else 100.0
                 flow_rtt = float(f.get("rtt_ms", 0.0) or rtt_ms)
                 flow_jitter = float(f.get("jitter_ms", 0.0) or jitter_ms)

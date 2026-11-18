@@ -293,9 +293,12 @@ def _snapshot_to_frontend(core: AgentCore, config: AgentConfig, store: Store) ->
         }
         # Optional fields are omitted when the kernel gives us nothing, so the
         # UI contract's optional strings are never sent as null.
-        person = dev.get("person")
+        person_row = store.execute(
+            "SELECT value FROM settings WHERE key=?", (f"ui:device_person:{did}",)
+        ).fetchone()
+        person = _json_dict(person_row["value"]).get("value") if person_row else None
         if person:
-            device_out["person"] = person
+            device_out["person"] = str(person)
         kind = dev.get("kind") or dev.get("type")
         if kind:
             device_out["type"] = kind
@@ -710,6 +713,23 @@ def create_app(
             content={"code": code, "message": message, "details": details},
         )
 
+    @app.exception_handler(Exception)
+    async def unhandled_error_handler(request: Request, exc: Exception):
+        logger.error(
+            "unhandled API error: %s",
+            exc,
+            exc_info=exc,
+            extra={"request_id": request_id()},
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "code": "internal_error",
+                "message": "The agent could not complete this request.",
+                "details": str(exc),
+            },
+        )
+
     # ------------------------------------------------------------------ idempotency
 
     idempotency_store: dict[str, Any] = {}
@@ -865,6 +885,9 @@ def create_app(
             return idempotency_store[key]
         body = await request.json()
         store: Store = app.state.store
+        # Accept the id in the body too, so an older client that sends
+        # PATCH /devices (without a path id) still targets the right row.
+        target_id = str(body.get("device_id") or body.get("id") or device_id)
         fields = []
         values: list[Any] = []
         for col in ("name", "mac", "ipv4", "ipv6"):
@@ -872,13 +895,16 @@ def create_app(
                 fields.append(f"{col}=?")
                 values.append(body[col])
         if fields:
-            values.append(device_id)
+            values.append(target_id)
             store.execute(
                 f"UPDATE devices SET {', '.join(fields)} WHERE device_id=?", tuple(values)
             )
-            store.commit()
-        idempotency_store[key or ""] = {"ok": True, "device_id": device_id}
-        return {"ok": True, "device_id": device_id}
+        if "person" in body:
+            _put_setting(store, f"ui:device_person:{target_id}", str(body["person"] or ""))
+        store.commit()
+        result = {"ok": True, "device_id": target_id}
+        idempotency_store[key or ""] = result
+        return result
 
     @app.get("/api/v1/flows", response_model=list[Flow])
     async def flows():
@@ -893,12 +919,13 @@ def create_app(
     async def correct_flow(flow_id: str, request: Request):
         key = idempotency_key(request)
         body = await request.json()
-        confirmed = body.get("confirmed_class")
+        confirmed = body.get("confirmed_class") or body.get("cls") or "unknown"
+        suggested = body.get("suggested_class") or ""
         store: Store = app.state.store
         store.execute(
             "INSERT OR REPLACE INTO corrections(correction_id, flow_id, suggested_class, "
             "confirmed_class, state, created_at) VALUES (?, ?, ?, ?, 'pending', ?)",
-            (f"corr-{flow_id}", flow_id, body.get("suggested_class", ""), confirmed, time.time()),
+            (f"corr-{flow_id}", flow_id, suggested, confirmed, time.time()),
         )
         store.commit()
         return {"ok": True, "flow_id": flow_id, "state": "pending"}
@@ -924,11 +951,16 @@ def create_app(
         device_id = body.get("device_id") or target.get("deviceId", "")
         traffic_class = body.get("traffic_class") or target.get("cls", "unknown")
         priority_raw = body.get("priority", 0)
-        priority = (
-            {"low": 0, "normal": 1, "high": 2}.get(priority_raw, int(priority_raw or 0))
-            if isinstance(priority_raw, str)
-            else int(priority_raw or 0)
-        )
+        if isinstance(priority_raw, str):
+            priority_key = priority_raw.strip().lower()
+            if priority_key in {"low", "normal", "high"}:
+                priority = {"low": 0, "normal": 1, "high": 2}[priority_key]
+            elif priority_key.isdigit():
+                priority = int(priority_key)
+            else:
+                priority = 0
+        else:
+            priority = int(priority_raw or 0)
         now = time.time()
         duration = float(body.get("durationSeconds", body.get("duration_s", 3600)) or 3600)
         deadline_raw = body.get("deadline")
@@ -1051,14 +1083,32 @@ def create_app(
     @app.post("/api/v1/safe-state/reset")
     async def safe_state_reset(request: Request):
         store: Store = app.state.store
+        config: AgentConfig = app.state.config
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        restore = bool(body.get("restore")) if isinstance(body, dict) else False
         now = time.time()
+        if restore:
+            config.mode = "lab"
+            action = "safe_state.restore"
+            target = "control-loop"
+            detail = {"mode": config.mode}
+            verdict = "restored_adaptive_mode"
+        else:
+            config.mode = "monitor"
+            action = "safe_state.reset"
+            target = "all-intents"
+            detail = {"mode": config.mode}
+            verdict = "reset_to_safe_state"
         store.execute("UPDATE intents SET state='cancelled' WHERE state='active'")
         store.execute(
             "INSERT INTO audit_log(ts, actor, action, target, result, details) VALUES (?, ?, ?, ?, ?, ?)",
-            (now, "owner", "safe_state.reset", "all-intents", "ok", "{}"),
+            (now, "owner", action, target, "ok", json.dumps(detail)),
         )
         store.commit()
-        return {"ok": True, "verdict": "reset_to_safe_state"}
+        return {"ok": True, "verdict": verdict}
 
     @app.get("/api/v1/ml/metrics")
     async def ml_metrics():
@@ -1264,7 +1314,7 @@ def create_app(
         demands = {}
         for f in flows:
             did = f.get("device_id", "unknown")
-            demands[did] = demands.get(did, 0.0) + f.get("bytes_per_s", 0) / 1_000_000.0
+            demands[did] = demands.get(did, 0.0) + f.get("bytes_per_s", 0) * 8.0 / 1_000_000.0
         conflicts = negotiation.detect_conflicts(demands, float(capacity))
         return [
             {
@@ -1300,7 +1350,11 @@ def create_app(
     async def conflicts_adjust(conflict_id: str, request: Request):
         negotiation = app.state.negotiation
         body = await request.json()
-        option_index = int(body.get("option", 1))
+        raw_option = body.get("option", 1)
+        try:
+            option_index = int(raw_option)
+        except (TypeError, ValueError):
+            option_index = 1
         conflict = negotiation.resolve(conflict_id, option_index)
         if not conflict:
             raise HTTPException(status_code=404, detail={"code": "not_found", "message": "conflict not found or not pending"})

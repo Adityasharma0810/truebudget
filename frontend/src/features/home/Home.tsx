@@ -24,7 +24,6 @@ import {
   GitBranch,
   CheckCircle2,
 } from "lucide-react";
-import NumberFlow from "@number-flow/react";
 import { motion } from "motion/react";
 import { useApi } from "../../lib/api";
 import { useConsole, FreshnessPill } from "../../app/Layout";
@@ -42,7 +41,6 @@ import {
 import { CapacityChart, Sparkline } from "../../components/Chart";
 import { Topology } from "../../components/Topology";
 import { SpotlightCard, Reveal } from "../../motion/primitives";
-import { useEffectiveTier } from "../../motion/store";
 import { percent, dateTime } from "../../lib/format";
 import type { MetricPoint, Decision, Intent } from "../../types";
 import { remainingSeconds } from "../../lib/qoe";
@@ -55,7 +53,6 @@ export default function Home() {
   const { data: decisions = [] } = useApi<Decision[]>("/decisions");
   const { data: intents = [] } = useApi<Intent[]>("/intents");
   const [boostDevice, setBoostDevice] = useState(s.devices[0]?.id ?? "");
-  const tier = useEffectiveTier();
   const active = s.devices.filter((d) => d.flows.length).length;
   const householdQoe = s.household.qoe;
   const score = householdQoe === null ? null : Math.round(householdQoe * 100);
@@ -83,11 +80,7 @@ export default function Home() {
           <div className="stat-value-row">
             <div>
               <div className="stat-value">
-                {score === null ? (
-                  <span>—</span>
-                ) : (
-                  <NumberFlow value={score} animated={tier === "Full" || tier === "Balanced"} />
-                )}
+                {score === null ? <span>—</span> : <LiveNumber value={score} />}
                 <span>/100</span>
               </div>
               <div className="stat-note">
@@ -142,11 +135,7 @@ export default function Home() {
           <div className="stat-value-row">
             <div>
               <div className="stat-value">
-                <NumberFlow
-                  value={s.link.capacityMbps}
-                  format={{ maximumFractionDigits: 1, minimumFractionDigits: 1 }}
-                  animated={tier === "Full" || tier === "Balanced"}
-                />
+                <LiveNumber value={s.link.capacityMbps} digits={1} />
                 <span>Mbps</span>
               </div>
               <div className="stat-note">± {s.link.uncertaintyMbps} Mbps uncertainty</div>
@@ -206,11 +195,7 @@ export default function Home() {
           <div className="stat-value-row">
             <div>
               <div className="stat-value">
-                <NumberFlow
-                  value={s.household.fairness}
-                  format={{ minimumFractionDigits: 2, maximumFractionDigits: 2 }}
-                  animated={tier === "Full" || tier === "Balanced"}
-                />
+                <LiveNumber value={s.household.fairness} digits={2} />
                 <span>/1.00</span>
               </div>
               <div className="stat-note">A fair share, not an equal split</div>
@@ -456,7 +441,8 @@ function SectionWelcome() {
     <header className="page-heading home-heading">
       <div>
         <div className="home-eyebrow">
-          <span className="home-eyebrow-line" /> YOUR NETWORK, IN HARMONY <EmulatedBadge />
+          <span className="home-eyebrow-line" /> YOUR NETWORK, IN HARMONY{" "}
+          {s.agent.emulated && <EmulatedBadge />}
         </div>
         <h1>
           Good things flow together<span className="heading-period">.</span>
@@ -471,6 +457,9 @@ function SectionWelcome() {
       </div>
     </header>
   );
+}
+function LiveNumber({ value, digits = 0 }: { value: number; digits?: number }) {
+  return <span className="live-number">{value.toFixed(digits)}</span>;
 }
 function LaptopIcon() {
   return <Network size={15} />;

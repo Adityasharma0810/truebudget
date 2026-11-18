@@ -289,7 +289,12 @@ export default function Intent() {
                 <Button
                   variant="secondary"
                   pending={cancel.isPending}
-                  onClick={() => cancel.mutate({ path: `/intents?id=${i.id}`, method: "DELETE" })}
+                  onClick={() =>
+                    cancel.mutate({
+                      path: `/intents/${encodeURIComponent(i.id)}`,
+                      method: "DELETE",
+                    })
+                  }
                 >
                   Cancel boost
                 </Button>

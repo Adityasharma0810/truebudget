@@ -316,7 +316,10 @@ export default function Tree() {
                   className="full-width"
                   onClick={() =>
                     task.mutate(
-                      { path: `/flows/${flow.id}/correct`, body: { cls: correction } },
+                      {
+                        path: `/flows/${encodeURIComponent(flow.id)}/correct`,
+                        body: { confirmed_class: correction, suggested_class: flow.cls },
+                      },
                       {
                         onSuccess: () =>
                           setFlow({ ...flow, cls: correction as Flow["cls"], confidence: 1 }),

@@ -40,7 +40,7 @@ export default function Lab() {
     <>
       <SectionHeading
         title="What if your network had a rough day?"
-        description="Put adaptive control to the test. Every scenario is safe, reversible, and entirely emulated."
+        description="Put adaptive control to the test. Scenario targets are synthetic illustrations; the chart below stays live and monitor-only, and running a scenario changes no network traffic."
       >
         <EmulatedBadge />
         {snapshot.scenario && (
@@ -125,16 +125,16 @@ export default function Lab() {
       </div>
       <section className="card scenario-monitor">
         <CardHeader
-          title={snapshot.scenario ? "The agent is making room." : "Ready when you are."}
+          title={snapshot.scenario ? "Scenario state recorded." : "Ready when you are."}
           subtitle={
             snapshot.scenario
-              ? "Watch call latency stay steady as the unmanaged baseline rises."
-              : "Start a scenario above to see congestion and recovery."
+              ? "The agent stored this scenario. The chart below remains live measurement data; no traffic or qdisc is changed."
+              : "Start a scenario above to record it. The chart below shows live measurements."
           }
         >
           <Badge tone={snapshot.scenario ? "blue" : "neutral"}>
             <Activity size={11} />
-            {snapshot.scenario ? "Live emulation" : "Standing by"}
+            {snapshot.scenario ? "State only" : "Standing by"}
           </Badge>
         </CardHeader>
         <div className="race-chart-legend">
@@ -161,8 +161,8 @@ export default function Lab() {
       <div className="scenario-bottom-note">
         <FlaskConical size={19} />
         <p>
-          <strong>Curiosity without consequences.</strong> Scenarios change only the in-browser
-          agent state. Stop at any time to restore normal capacity.
+          <strong>Curiosity without consequences.</strong> Scenarios record state only: no qdisc is
+          changed, no traffic is simulated, and metrics below stay live.
         </p>
         <Link to="/app/experiments" className="text-link">
           Compare with an A/B run <ArrowRight size={13} />

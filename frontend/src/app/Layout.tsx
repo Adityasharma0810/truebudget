@@ -153,7 +153,7 @@ export function Layout() {
   const snapshot = snapshotQuery.data;
   const offline = snapshotQuery.isError;
   const stale =
-    !!snapshot && now - lastChanged > Math.max(6000, (snapshot.agent.intervalSeconds * 2000) / 10);
+    !!snapshot && now - lastChanged > Math.max(6000, snapshot.agent.intervalSeconds * 2000);
   const current =
     navGroups.flatMap((g) => g.items).find((x) => x.path === location.pathname)?.name ??
     "About & limitations";
@@ -360,7 +360,7 @@ export function Layout() {
                     <strong>Safe state is active</strong>
                     <p>
                       {snapshot.alerts[0]?.message ??
-                        "Conservative shaping is active. Floors remain protected."}
+                        "Temporary priorities are cancelled. The agent is monitoring with a conservative plan; no qdisc is changed."}
                     </p>
                   </div>
                   <Button

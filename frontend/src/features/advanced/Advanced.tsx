@@ -168,7 +168,7 @@ export function Conflicts() {
                   task.mutate(
                     {
                       path: `/conflicts/${conflict.id}/${choice === 0 ? "accept" : "adjust"}`,
-                      body: { option: conflict.options[choice].name },
+                      body: { option: choice },
                     },
                     { onSuccess: () => setConfirm(false) },
                   )
@@ -673,7 +673,7 @@ export function Agent() {
         <p className="dialog-description">
           {confirm === "rotate"
             ? "The previous demo key will be invalidated. A new key will be shown once, masked by default."
-            : "This session will lose access to the emulated agent. This browser remains connected."}
+            : "This session will lose access to the agent. This browser remains connected."}
         </p>
         <div className="modal-footer">
           <Button variant="secondary" onClick={() => setConfirm(null)}>
@@ -684,7 +684,10 @@ export function Agent() {
             onClick={() =>
               task.mutate(
                 {
-                  path: confirm === "rotate" ? "/keys/rotate" : `/sessions?id=${confirm}`,
+                  path:
+                    confirm === "rotate"
+                      ? "/keys/rotate"
+                      : `/sessions/${encodeURIComponent(confirm ?? "")}`,
                   method: confirm === "rotate" ? "POST" : "DELETE",
                 },
                 {

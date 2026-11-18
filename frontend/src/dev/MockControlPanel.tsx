@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { SlidersHorizontal, RotateCcw, Play } from "lucide-react";
 import { useApi } from "../lib/api";
-import { Button, Modal, useTask, Badge, EmulatedBadge } from "../components/ui";
+import { Button, Modal, useTask } from "../components/ui";
 import { Toggle } from "../features/settings/Settings";
 import type { MockControl, Capabilities } from "../types";
 export default function DevControlPanel() {
@@ -21,9 +21,10 @@ export default function DevControlPanel() {
   }, []);
   return (
     <Modal drawer open={open} onClose={() => setOpen(false)} title="Dev control panel">
-      <EmulatedBadge />
       <p className="field-hint">
-        Development controls · Ctrl + Shift + M. These controls affect the live agent runtime.
+        Development controls · Ctrl + Shift + M. These switches are stored by the agent but are
+        not wired into the live sampling loop, so they do not change measurements or displayed
+        data. Use them only to test persistence of the dev API.
       </p>
       {data && (
         <>

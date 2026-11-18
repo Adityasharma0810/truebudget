@@ -88,7 +88,8 @@ export function Landing() {
               </Link>
             </div>
             <div className="hero-note">
-              <ShieldCheck size={14} /> Local-first. Privacy-safe. Fair by design. <EmulatedBadge />
+              <ShieldCheck size={14} /> Local-first. Privacy-safe. Fair by design.{" "}
+              {snapshot?.agent.emulated && <EmulatedBadge />}
             </div>
           </Reveal>
         </section>
@@ -159,8 +160,10 @@ export function Landing() {
           <div>
             <h3>Designed with privacy. Built with honesty.</h3>
             <p>
-              Metadata, not packet contents. QoE scores are proxies, not promises. This demo is
-              fully emulated and does not change your network traffic.
+              Metadata, not packet contents. QoE scores are proxies, not promises.{" "}
+              {snapshot?.agent.emulated
+                ? "This demo is fully emulated and does not change your network traffic."
+                : "The local agent is live and monitor-only: it measures your traffic but does not change it."}
             </p>
           </div>
           <Link to="/about">
@@ -169,7 +172,9 @@ export function Landing() {
         </section>
         {cap && (
           <p className="landing-seed">
-            Reproducible demo · Seed {cap.seed} · No real traffic is shaped
+            {snapshot?.agent.emulated
+              ? `Reproducible demo · Seed ${cap.seed} · No real traffic is shaped`
+              : "Live local agent · Monitor-only · No real traffic is shaped"}
           </p>
         )}
       </main>
@@ -344,7 +349,7 @@ export function Connect() {
           localStorage.setItem("eb-key", key);
         } catch {}
       navigate("/app");
-      useToasts.getState().push("Connected to your emulated home agent.");
+      useToasts.getState().push("Connected to your local agent.");
     } catch (e) {
       setStage(0);
       setError(e instanceof Error ? e.message : "Connection failed.");
@@ -499,6 +504,8 @@ export function Connect() {
 }
 export function About({ embedded = false }: { embedded?: boolean }) {
   const { data: formulas, error } = useApi<Record<string, string>>("/qoe/formulas");
+  const { data: snapshot } = useApi<Snapshot>("/state/snapshot");
+  const emulated = snapshot?.agent.emulated ?? true;
   return (
     <div className={embedded ? "" : "public-page"}>
       {!embedded && <PublicHeader />}
@@ -510,13 +517,23 @@ export function About({ embedded = false }: { embedded?: boolean }) {
         </p>
         <section className="card about-block">
           <CardHeader title="What you’re looking at">
-            <EmulatedBadge />
+            {emulated && <EmulatedBadge />}
           </CardHeader>
-          <p>
-            This is a fully emulated, browser-local demonstration. No Linux agent is running, no
-            network packets are inspected, and no real traffic is shaped. Scenarios, classifier
-            metrics, history, and experiments are synthetic. Demo seed: <strong>4242</strong>.
-          </p>
+          {emulated ? (
+            <p>
+              This is a fully emulated, browser-local demonstration. No Linux agent is running, no
+              network packets are inspected, and no real traffic is shaped. Scenarios, classifier
+              metrics, history, and experiments are synthetic. Demo seed: <strong>4242</strong>.
+            </p>
+          ) : (
+            <p>
+              This console is connected to the local agent running on this machine. It reads kernel
+              socket statistics, interface counters, and probes RTT, jitter, and loss. It is
+              monitor-only: no qdisc is changed. Classifier metrics and capacity come from live
+              measurements; scenario-lab and A/B experiment results remain synthetic and are
+              labelled as such.
+            </p>
+          )}
           <p>
             Real control requires an Ubuntu machine inline between the router and devices. Windows
             and Docker demonstrations do not shape a Windows PC’s traffic. Relay and Direct LAN
