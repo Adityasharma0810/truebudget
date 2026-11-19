@@ -30,7 +30,10 @@ export const useToasts = create<{
 }>((set, get) => ({
   items: [],
   push: (text, error = false) => {
-    const id = Date.now();
+    // Repeated notices (for example an automatic motion step-down firing on
+    // several frames) should not stack up and cover the console.
+    if (get().items.some((item) => item.text === text && item.error === error)) return;
+    const id = Date.now() + Math.random();
     set((s) => ({ items: [...s.items, { id, text, error }] }));
     setTimeout(() => get().remove(id), 4500);
   },

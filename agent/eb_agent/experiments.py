@@ -3,17 +3,28 @@
 Runs reproducible scenario comparisons through the lab harness using
 deterministic seeds.  All results are emulated/synthetic -- clearly marked
 so they are never mistaken for real measurements.
+
+The harness needs a user+network namespace to build its virtual household.
+When the agent itself is not running inside one (the common case) the
+harness re-executes itself via ``unshare -Urn``; the experiment therefore
+runs in a subprocess instead of blocking the API event loop.
 """
 
 from __future__ import annotations
 
+import collections
 import json
+import os
+import subprocess
+import sys
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Sequence
 
-from eb_agent.lab.harness import CONTROLLERS, run_profile
+AGENT_DIR = Path(__file__).resolve().parents[1]
 
 
 @dataclass
@@ -36,6 +47,7 @@ class Experiment:
     status: str  # queued | running | completed | failed
     results: list[ExperimentResult] = field(default_factory=list)
     error: str | None = None
+    emulated: bool = True
     created_at: float = field(default_factory=time.time)
 
 
@@ -88,68 +100,130 @@ def _ci(values: Sequence[float]) -> float:
     return round(1.96 * std / (len(values) ** 0.5), 4)
 
 
+def _capacity_for(scenario_name: str) -> float:
+    return {
+        "saturating_call": 50.0,
+        "gaming_download": 100.0,
+        "mixed_household": 75.0,
+        "bulk_backfill": 40.0,
+    }.get(scenario_name, 50.0)
+
+
+def _run_harness(
+    store: ExperimentStore,
+    exp: Experiment,
+    *,
+    duration_s: float,
+    capacity_mbps: float,
+) -> list[dict[str, object]]:
+    """Run the harness CLI and return its per-controller rows.
+
+    The CLI fans every trial out over the three controllers so the
+    measurements share a seed, workload and link trace.
+    """
+    controllers = ["unmanaged", "cake_static", "experience_budget"]
+    planned = exp.trials * len(controllers)
+    with tempfile.TemporaryDirectory(prefix="eb-experiment-") as tmp:
+        json_path = Path(tmp) / "rows.json"
+        csv_path = Path(tmp) / "rows.csv"
+        command = [
+            sys.executable,
+            "-m",
+            "eb_agent.lab.harness",
+            "--controllers",
+            ",".join(controllers),
+            "--seed",
+            str(exp.seed),
+            "--duration",
+            f"{duration_s:g}",
+            "--trials",
+            str(exp.trials),
+            "--capacity-mbps",
+            f"{capacity_mbps:g}",
+            "--out",
+            str(csv_path),
+            "--json",
+            str(json_path),
+        ]
+        env = {
+            **os.environ,
+            "PYTHONPATH": os.pathsep.join(
+                [str(AGENT_DIR), os.environ.get("PYTHONPATH", "")]
+            ).strip(os.pathsep),
+            "PYTHONUNBUFFERED": "1",
+        }
+        process = subprocess.Popen(
+            command,
+            cwd=str(AGENT_DIR),
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        tail: collections.deque[str] = collections.deque(maxlen=12)
+        completed = 0
+        assert process.stderr is not None
+        for line in process.stderr:
+            line = line.rstrip()
+            if not line:
+                continue
+            tail.append(line)
+            if "controller=" in line:
+                completed += 1
+                exp.progress = min(99, int(completed / planned * 100))
+                store.update(exp)
+        returncode = process.wait()
+        if returncode != 0:
+            detail = " | ".join(tail) or f"harness exited with {returncode}"
+            raise RuntimeError(detail)
+        if not json_path.exists():
+            detail = " | ".join(tail) or "harness produced no JSON"
+            raise RuntimeError(detail)
+        rows = json.loads(json_path.read_text(encoding="utf-8"))
+        if not isinstance(rows, list) or not rows:
+            raise RuntimeError("harness produced no rows")
+        return rows
+
+
 def run_experiment(store: ExperimentStore, exp: Experiment) -> None:
     """Run an A/B experiment: unmanaged vs cake_static vs experience_budget.
 
-    Mutates ``exp`` in place.  Called synchronously from the API handler;
-    for a real deployment this would be a background task.
+    Mutates ``exp`` in place.  Blocking; the API schedules it on a worker
+    thread so the request can return while the lab run is in progress.
     """
 
     exp.status = "running"
-    exp.progress = 0
+    exp.progress = 1
     store.update(exp)
 
     try:
-        scenario_name = exp.scenario
-        # Determine capacity from scenario-like defaults.
-        capacity_map = {
-            "saturating_call": 50.0,
-            "gaming_download": 100.0,
-            "mixed_household": 75.0,
-            "bulk_backfill": 40.0,
+        capacity = _capacity_for(exp.scenario)
+        rows = _run_harness(store, exp, duration_s=2.0, capacity_mbps=capacity)
+        by_controller: dict[str, list[dict[str, object]]] = {
+            c: [r for r in rows if r.get("controller") == c]
+            for c in ("unmanaged", "cake_static", "experience_budget")
         }
-        capacity = capacity_map.get(scenario_name, 50.0)
+        missing = [name for name, values in by_controller.items() if not values]
+        if missing:
+            raise RuntimeError(
+                "harness did not return rows for: " + ", ".join(missing)
+            )
 
-        controllers = ["unmanaged", "cake_static", "experience_budget"]
-        rows: dict[str, list[dict]] = {c: [] for c in controllers}
-
-        for trial in range(1, exp.trials + 1):
-            for ctrl in controllers:
-                row = run_profile(
-                    CONTROLLERS[ctrl],
-                    seed=exp.seed + trial - 1,
-                    duration_s=10.0,
-                    trial=trial,
-                    devices=4,
-                    capacity_mbps=capacity,
+        def metric(source: str) -> dict[str, float]:
+            return {
+                name: _average(
+                    [
+                        float(row.get(source) or 0.0)
+                        for row in values
+                        if row.get(source) is not None
+                    ]
                 )
-                rows[ctrl].append(row)
-            exp.progress = int(trial / exp.trials * 100)
-            store.update(exp)
+                for name, values in by_controller.items()
+            }
 
-        # Aggregate metrics across trials.
-        call_rtt = {
-            c: _average(
-                [float(r.get("call_p95_rtt_ms", 0.0)) for r in rows[c] if r.get("call_p95_rtt_ms") is not None]
-            )
-            for c in controllers
-        }
-        bulk = {
-            c: _average(
-                [float(r.get("bulk_throughput_mbps", 0.0)) for r in rows[c] if r.get("bulk_throughput_mbps") is not None]
-            )
-            for c in controllers
-        }
-        qoe = {
-            c: _average(
-                [float(r.get("worst_device_qoe", 0.0)) for r in rows[c] if r.get("worst_device_qoe") is not None]
-            )
-            for c in controllers
-        }
-
-        call_rtt_values = [call_rtt[c] for c in controllers]
-        bulk_values = [bulk[c] for c in controllers]
-        qoe_values = [qoe[c] for c in controllers]
+        call_rtt = metric("call_p95_rtt_ms")
+        bulk = metric("bulk_throughput_mbps")
+        qoe = metric("worst_device_qoe")
 
         exp.results = [
             ExperimentResult(
@@ -158,7 +232,7 @@ def run_experiment(store: ExperimentStore, exp: Experiment) -> None:
                 unmanaged=call_rtt["unmanaged"],
                 cake=call_rtt["cake_static"],
                 eb=call_rtt["experience_budget"],
-                ci=_ci(call_rtt_values),
+                ci=_ci([call_rtt[c] for c in by_controller]),
             ),
             ExperimentResult(
                 metric="Bulk throughput",
@@ -166,21 +240,22 @@ def run_experiment(store: ExperimentStore, exp: Experiment) -> None:
                 unmanaged=bulk["unmanaged"],
                 cake=bulk["cake_static"],
                 eb=bulk["experience_budget"],
-                ci=_ci(bulk_values),
+                ci=_ci([bulk[c] for c in by_controller]),
             ),
             ExperimentResult(
                 metric="Worst-device QoE",
                 unit="proxy",
-                unmanaged=qoe["unmanaged"] if qoe["unmanaged"] is not None else 0.0,
-                cake=qoe["cake_static"] if qoe["cake_static"] is not None else 0.0,
-                eb=qoe["experience_budget"] if qoe["experience_budget"] is not None else 0.0,
-                ci=_ci(qoe_values),
+                unmanaged=qoe["unmanaged"],
+                cake=qoe["cake_static"],
+                eb=qoe["experience_budget"],
+                ci=_ci([qoe[c] for c in by_controller]),
             ),
         ]
 
         exp.status = "completed"
         exp.progress = 100
-    except Exception as error:  # noqa: BLE001
+        exp.error = None
+    except Exception as error:  # noqa: BLE001 - the UI needs the real reason
         exp.status = "failed"
         exp.error = str(error)
     finally:

@@ -293,7 +293,18 @@ CREATE TABLE IF NOT EXISTS demand_schedules (
 );
 """
 
-MIGRATIONS: dict[int, str] = {1: SCHEMA_SQL}
+MIGRATION_2 = """
+CREATE TABLE IF NOT EXISTS model_metrics (
+  model_id TEXT PRIMARY KEY,
+  metrics TEXT NOT NULL,
+  created_at REAL NOT NULL,
+  FOREIGN KEY(model_id) REFERENCES models(model_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_model_metrics_created ON model_metrics(created_at);
+"""
+
+MIGRATIONS: dict[int, str] = {1: SCHEMA_SQL, 2: MIGRATION_2}
 
 
 class Store:

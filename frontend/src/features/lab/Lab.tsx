@@ -83,18 +83,18 @@ export default function Lab() {
               <p>{s.description}</p>
               <div className="scenario-comparison">
                 <div>
-                  <span>Unmanaged RTT</span>
+                  <span>Unmanaged QoE</span>
                   <strong>
-                    {s.baseline}
-                    <small>ms</small>
+                    {s.baseline.toFixed(2)}
+                    <small>proxy</small>
                   </strong>
                 </div>
                 <ArrowRight size={15} />
                 <div>
-                  <span>EB call RTT</span>
+                  <span>EB call QoE</span>
                   <strong>
-                    {s.managed}
-                    <small>ms</small>
+                    {s.managed.toFixed(2)}
+                    <small>proxy</small>
                   </strong>
                 </div>
               </div>
@@ -150,11 +150,11 @@ export default function Lab() {
         <div className="scenario-monitor-footer">
           <ShieldCheck size={15} />
           <p>
-            Policy responds within 2–5 seconds in the demo. The WAN-drop scenario includes a
-            verifier rollback. All outcomes are synthetic illustrations.
+            Scenario targets above are synthetic illustrations. Selecting one records a labelled
+            state only; the latency chart is live measured data from this agent.
           </p>
-          <Link to="/app/decisions" className="text-link">
-            See the decisions <ArrowRight size={13} />
+          <Link to="/app/experiments" className="text-link">
+            Run a seeded A/B experiment <ArrowRight size={13} />
           </Link>
         </div>
       </section>

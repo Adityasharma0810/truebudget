@@ -144,7 +144,15 @@ export default function Home() {
           </div>
           <div className="stat-bottom">
             <span className="mini-line" /> Confidence {percent(s.link.forecastConfidence)}{" "}
-            <span className="stat-bottom-right">Estimated</span>
+            <span className="stat-bottom-right">
+              {s.link.forecastMethod === "holt_winters"
+                ? "Holt-Winters"
+                : s.link.forecastMethod === "linear_trend"
+                  ? "Linear trend"
+                  : s.link.forecastMethod === "persistence"
+                    ? "Persistence"
+                    : "Unavailable"}
+            </span>
           </div>
         </SpotlightCard>
         <SpotlightCard className="stat-card">
@@ -261,7 +269,14 @@ export default function Home() {
               <span>
                 <Sparkles size={12} /> Forecast confidence{" "}
                 <strong>{percent(s.link.forecastConfidence)}</strong>
-                <InfoTip text="Forecast is only used above the configured confidence threshold. Otherwise the controller reacts to observed capacity." />
+                {s.link.forecastGate && !s.link.forecastGate.useForecast && (
+                  <span className="stat-bottom-right"> reactive fallback</span>
+                )}
+                <InfoTip
+                  text={`Forecast is only used above the configured confidence threshold. Gate: ${
+                    s.link.forecastGate?.reason ?? "unavailable"
+                  }.`}
+                />
               </span>
               <Link to="/app/metrics">
                 Explore metrics <ArrowRight size={12} />

@@ -142,6 +142,12 @@ class PairingManager:
         self._secrets[secret] = ps
         return ps
 
+    def rotate(self, agent_id: str, agreement_pub_hex: str) -> PairingSecret:
+        """Invalidate every outstanding pairing secret and issue a new one."""
+
+        self._secrets.clear()
+        return self.create(agent_id, agreement_pub_hex)
+
     def consume(self, key: str) -> PairingSecret | None:
         now = time.time()
         ps = self._secrets.get(key)
@@ -172,6 +178,8 @@ class Session:
     created_at: float
     expires_at: float
     revoked_at: float | None = None
+    client: str = ""
+    user_agent: str = ""
 
 
 class SessionManager:
@@ -181,7 +189,15 @@ class SessionManager:
         self.store = store
         self._sessions: dict[str, Session] = {}
 
-    def create(self, agent_id: str, role: str = "owner", ttl_s: float = 3600.0) -> Session:
+    def create(
+        self,
+        agent_id: str,
+        role: str = "owner",
+        ttl_s: float = 3600.0,
+        *,
+        client: str = "",
+        user_agent: str = "",
+    ) -> Session:
         session_id = secrets.token_urlsafe(24)
         session = Session(
             session_id=session_id,
@@ -189,6 +205,8 @@ class SessionManager:
             role=role,
             created_at=time.time(),
             expires_at=time.time() + ttl_s,
+            client=client,
+            user_agent=user_agent[:180],
         )
         self._sessions[session_id] = session
         return session

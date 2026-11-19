@@ -32,6 +32,12 @@ export default function ML() {
   if (error) return <ErrorState message={error.message} retry={() => void refetch()} />;
   if (!data) return <Skeletons />;
   const queue = data.corrections.filter((c) => c.status === "pending");
+  const shadowLast = data.inference?.shadow?.last;
+  const shadowTotals = data.inference?.shadow?.totals;
+  const threshold = data.inference?.threshold ?? 0.6;
+  const shadowClasses = Object.entries(data.inference?.shadow?.byClass ?? {})
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 4);
   return (
     <>
       <SectionHeading
@@ -50,6 +56,55 @@ export default function ML() {
           <BrainCircuit size={14} /> Retrain locally
         </Button>
       </SectionHeading>
+      <section className="card ml-live">
+        <div className="ml-live-model">
+          <span className="soft-icon">
+            <BrainCircuit size={18} />
+          </span>
+          <div>
+            <strong>{data.trained ? data.modelKind ?? "Local classifier" : "Rule baseline"}</strong>
+            <p>
+              {data.trained
+                ? `Active local model · ${data.nTrain ?? "—"} train rows · ${data.nTest ?? "—"} holdout rows${data.trainedAt ? ` · trained ${data.trainedAt.slice(0, 10)}` : ""}`
+                : "No local model is loaded; deterministic port/rate rules classify every flow."}
+            </p>
+          </div>
+        </div>
+        <div className="ml-live-counts">
+          <span>
+            <strong>{data.inference?.lastTickMl ?? 0}</strong> accepted by model
+          </span>
+          <span>
+            <strong>{shadowLast?.belowThreshold ?? 0}</strong> below {threshold.toFixed(2)}
+          </span>
+          <span>
+            <strong>{shadowLast?.domainGuard ?? 0}</strong> missing features
+          </span>
+          <span>
+            <strong>{data.inference?.lastTickRule ?? 0}</strong> rule answered
+          </span>
+          <span className="ml-live-classes">
+            {Object.entries(data.inference?.byClass ?? {})
+              .sort((a, b) => b[1] - a[1])
+              .slice(0, 4)
+              .map(([cls, count]) => `${cls} ${count}`)
+              .join(" · ") || "waiting for flows"}
+          </span>
+        </div>
+      </section>
+      <p className="page-note">
+        <Info size={14} /> Shadow inference would have chosen{" "}
+        {shadowClasses.length
+          ? shadowClasses.map(([cls, count]) => `${cls} ${count}`).join(" · ")
+          : "nothing yet"}
+        . The model has evaluated {shadowTotals?.evaluated ?? 0} live flow
+        {shadowTotals?.evaluated === 1 ? "" : "s"} in total; the rule baseline answered{" "}
+        {shadowTotals?.belowThreshold ?? 0} below-threshold and{" "}
+        {shadowTotals?.domainGuard ?? 0} unmeasured flows instead of forcing a guess.
+      </p>
+      <p className="page-note">
+        <Info size={14} /> {data.trainingNote ?? "Evaluation source is reported by the agent."}
+      </p>
       <div className="ml-stats">
         {[
           {
@@ -64,7 +119,7 @@ export default function ML() {
           {
             title: "Encrypted subset",
             value: data.encrypted,
-            desc: "Lower certainty, not guessed labels",
+            desc: "Share of recent flows on encrypted ports (port measurement)",
           },
         ].map((m) => (
           <section className="card ml-stat" key={m.title}>

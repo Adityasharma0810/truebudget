@@ -92,15 +92,20 @@ def test_settings(test_client):
     client, _ = test_client
     r = client.get("/api/v1/settings")
     assert r.status_code == 200
-    assert r.json()["mode"] == "gateway"
-    assert r.json()["shaping_factor"] == 0.8
+    body = r.json()
+    assert body["rateChangePct"] == 20
+    assert body["floorMbps"] == 2
+    assert "flags" in body
 
 
 def test_put_settings(test_client):
     client, _ = test_client
     r = client.put("/api/v1/settings", json={"mode": "bridge"})
     assert r.status_code == 200
-    assert r.json()["ok"] is True
+    body = r.json()
+    assert body["floorMbps"] == 2
+    assert body["rateChangePct"] == 20
+    assert "flags" in body
 
 
 def test_safe_state_reset(test_client):
@@ -149,7 +154,7 @@ def test_create_intent(test_client):
         json={"device_id": "dev-1", "traffic_class": "call", "goal": "boost", "priority": 5},
     )
     assert r.status_code == 200
-    assert "intent_id" in r.json()
+    assert "id" in r.json()
 
 
 def test_links(test_client):

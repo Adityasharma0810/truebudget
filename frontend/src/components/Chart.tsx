@@ -28,15 +28,16 @@ export const CapacityChart = memo(function CapacityChart({
     top = 14,
     bottom = 30;
   const isThroughput = metric === "throughput";
-  const max = isThroughput
-    ? 120
-    : metric === "fairness"
+  const observed = [
+    ...points.map((p) => p[metric]),
+    ...(isThroughput ? points.flatMap((p) => [p.capacity, p.hi]) : []),
+    ...(baseline ? points.map((p) => p.baseline) : []),
+    ...(isThroughput && forecast ? forecast.map((f) => f.hi) : []),
+  ].filter((v) => Number.isFinite(v)) as number[];
+  const max =
+    metric === "fairness"
       ? 1
-      : Math.max(
-          metric === "latency" ? 40 : 10,
-          ...points.map((p) => p[metric]),
-          ...(baseline ? points.map((p) => p.baseline) : []),
-        ) * 1.15;
+      : Math.max(metric === "latency" ? 40 : 10, ...observed) * 1.15;
   const x = scaleLinear()
     .domain([0, Math.max(1, points.length - 1)])
     .range([left, width - right - (forecast && isThroughput ? 105 : 0)]);
@@ -46,19 +47,25 @@ export const CapacityChart = memo(function CapacityChart({
   const line = (key: keyof MetricPoint, subset = points) =>
     subset.map((p, i) => `${i === 0 ? "M" : "L"}${x(i)},${y(Number(p[key]))}`).join(" ");
   const path = useMemo(() => line(metric), [points, metric, height]);
-  const endX = x(points.length - 1);
-  const endY = y(points[points.length - 1]?.[metric] ?? 0);
-  const capacityPath = line("capacity");
+  const hasLine = points.length > 1;
+  const endX = points.length ? x(points.length - 1) : left;
+  const endY = points.length ? y(points[points.length - 1]?.[metric] ?? 0) : height - bottom;
+  const capacityPath = hasLine ? line("capacity") : "";
   const bottomY = height - bottom;
-  const band =
-    points.map((p, i) => `${x(i)},${y(p.hi)}`).join(" ") +
-    " " +
-    points
-      .slice()
-      .reverse()
-      .map((p, i) => `${x(points.length - 1 - i)},${y(p.lo)}`)
-      .join(" ");
+  const band = hasLine
+    ? points.map((p, i) => `${x(i)},${y(p.hi)}`).join(" ") +
+      " " +
+      points
+        .slice()
+        .reverse()
+        .map((p, i) => `${x(points.length - 1 - i)},${y(p.lo)}`)
+        .join(" ")
+    : "";
   const item = hover === null ? null : points[hover];
+  const labelStep = Math.max(1, Math.ceil(points.length / 5));
+  const labelIndices = points
+    .map((_, i) => i)
+    .filter((i) => i === 0 || i === points.length - 1 || i % labelStep === 0);
   return (
     <div className={`chart ${compact ? "compact-chart" : ""}`}>
       <svg
@@ -93,7 +100,7 @@ export const CapacityChart = memo(function CapacityChart({
             </text>
           </g>
         ))}
-        {isThroughput && (
+        {isThroughput && hasLine && (
           <>
             <polygon points={band} fill="#a8b7cf" opacity=".10" />
             <path
@@ -105,7 +112,7 @@ export const CapacityChart = memo(function CapacityChart({
             />
           </>
         )}
-        {baseline && (
+        {baseline && hasLine && (
           <path
             d={line("baseline")}
             stroke="#b69ae8"
@@ -114,20 +121,34 @@ export const CapacityChart = memo(function CapacityChart({
             strokeDasharray="5 4"
           />
         )}
-        <path d={`${path}L${endX},${bottomY}L${left},${bottomY}Z`} fill={`url(#fill${id})`} />
-        <motion.path
-          key={metric}
-          d={path}
-          fill="none"
-          stroke="#5686f7"
-          strokeWidth="2.6"
-          strokeLinejoin="round"
-          initial={tier === "Full" || tier === "Balanced" ? { pathLength: 0 } : false}
-          animate={{ pathLength: 1 }}
-          transition={{ duration: t.duration.epic }}
-        />
-        <circle cx={endX} cy={endY} r="3.8" fill="#4c7dff" stroke="white" strokeWidth="2" />
-        {forecast && isThroughput && (
+        {hasLine && (
+          <>
+            <path d={`${path}L${endX},${bottomY}L${left},${bottomY}Z`} fill={`url(#fill${id})`} />
+            <motion.path
+              key={metric}
+              d={path}
+              fill="none"
+              stroke="#5686f7"
+              strokeWidth="2.6"
+              strokeLinejoin="round"
+              initial={tier === "Full" || tier === "Balanced" ? { pathLength: 0 } : false}
+              animate={{ pathLength: 1 }}
+              transition={{ duration: t.duration.epic }}
+            />
+            <circle cx={endX} cy={endY} r="3.8" fill="#4c7dff" stroke="white" strokeWidth="2" />
+          </>
+        )}
+        {!points.length && (
+          <text
+            x={(left + width - right) / 2}
+            y={(top + bottomY) / 2}
+            textAnchor="middle"
+            className="chart-empty-label"
+          >
+            Waiting for measurements
+          </text>
+        )}
+        {forecast && forecast.length > 0 && isThroughput && points.length > 0 && (
           <>
             <rect
               x={endX + 5}
@@ -160,19 +181,19 @@ export const CapacityChart = memo(function CapacityChart({
             />
           </>
         )}
-        {points
-          .filter((_, i) => i % 14 === 0 || i === points.length - 1)
-          .map((p, i, arr) => (
-            <text
-              key={p.ts}
-              x={left + (i / (arr.length - 1)) * (endX - left)}
-              y={height - 7}
-              textAnchor={i === 0 ? "start" : "middle"}
-              className="chart-label"
-            >
-              {dateTime(p.ts)}
-            </text>
-          ))}
+        {labelIndices.map((index, position) => (
+          <text
+            key={points[index].ts + index}
+            x={x(index)}
+            y={height - 7}
+            textAnchor={
+              position === 0 ? "start" : position === labelIndices.length - 1 ? "end" : "middle"
+            }
+            className="chart-label"
+          >
+            {dateTime(points[index].ts)}
+          </text>
+        ))}
         {item && hover !== null && (
           <g>
             <line

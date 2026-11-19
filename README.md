@@ -2,9 +2,9 @@
 
 Experience Budget is an intent-aware QoS/QoE controller for home broadband. It
 consists of a **Python Linux agent** (real-time traffic classification, capacity
-estimation, QoE scoring, max-min policy, and safe-state enforcement) and a
-**React web console** that connects to the agent in real time over WebSocket +
-end-to-end encryption.
+estimation, QoE scoring, max-min policy, and a monitor-only control loop on this
+build) and a **React web console** that connects to the agent's local HTTP +
+WebSocket API in real time.
 
 ## Architecture
 
@@ -13,7 +13,7 @@ end-to-end encryption.
 | Agent daemon (`eb-agentd`) | Python + FastAPI | Reads `/proc/net/dev` and `/proc/net/nf_conntrack`, classifies flows, estimates WAN capacity (Kalman + CUSUM), scores per-device QoE, runs max-min policy, serves `/api/v1` |
 | CLI (`eb-agent`) | Node.js | `init`, `pair`, `start`, `stop`, `status`, `doctor`, `config`, `mode`, `sessions`, `rotate-keys`, `update`, `safe-reset`, `export-diagnostics`, `uninstall`, `lab`, `logs` |
 | Web console | React + Vite | Real-time dashboard: devices, flows, QoE, intents, decisions, settings, health diagnosis, conflicts, experiments, federated status, ask/rag |
-| Transport | WebSocket + WebCrypto | `RelayTransport` (WS + ECDH P-256 → HKDF → AES-GCM E2E) or `DirectTransport` (HTTPS with fingerprint pinning) |
+| Transport | HTTP + WebSocket | `RelayTransport` talks to the agent's local API and stream; `DirectTransport` targets an HTTPS LAN host and enforces a secure page context |
 
 ## Quick start
 
@@ -43,8 +43,10 @@ EB_DATA_DIR=/tmp/eb-data node cli/bin/eb-agent.js start
 ```
 
 This launches the FastAPI API server on `http://localhost:7443` with the real-time
-control loops running. The agent reads live measurements from `/proc/net/dev`
-and `/proc/net/nf_conntrack` — no demo or synthetic data is used.
+control loops running. Live telemetry comes from `/proc/net/dev`,
+`/proc/net/nf_conntrack`, `ss`, and `ping`. Scenario targets and A/B experiments
+run in the synthetic lab and are labelled as such; they never masquerade as
+production measurements.
 
 Open another terminal and verify:
 
@@ -54,17 +56,19 @@ curl http://localhost:7443/api/v1/state/snapshot
 curl http://localhost:7443/api/v1/devices
 ```
 
-### 4. Pair the web console
+### 4. Connect the web console
 
-Generate a pairing key:
+Local read-only access does not require a pairing key in this build. To generate
+a local pairing secret anyway:
 
 ```sh
 node cli/bin/eb-agent.js pair --site-url https://localhost:8443
 ```
 
-This prints a key like `EB-XXXX-XXXX-XXXX` and a pairing link with a `#pk=`
-fragment. Open the web console (see step 5), enter the 12-character key on the
-Connect page, and choose **Relay** or **Direct** connection.
+This prints a key like `EB-XXXX-XXXX-XXXX` and a link with a `#pk=` fragment.
+Open the web console (see step 5) and connect with **Relay** (local API) or
+**Direct LAN** (HTTPS host). Pairing enforcement is not enabled yet, so the key
+is accepted but not required.
 
 ### 5. Start the web console
 
@@ -187,10 +191,12 @@ cd agent && unshare -Urn env PYTHONPATH=agent ../.venv/bin/python -m pytest -m n
 
 ## Data integrity
 
-All data is **real-time and live** — no demo, mock, or synthetic data is generated
-by the agent or the console. Metrics come from `/proc/net/dev`, `/proc/net/nf_conntrack`,
-and `ping` measurements. The dev control panel (`/api/v1/dev/control`) simulates
-fault conditions against the live backend for testing; it does not fabricate metrics.
+Production telemetry is **measured live** — metrics come from `/proc/net/dev`,
+`/proc/net/nf_conntrack`, `ss`, and `ping`. No mock transport ships in the
+console. Synthetic data is confined to the lab: scenario targets, the
+deterministic classifier training set, and seeded A/B experiment results are
+labelled in the UI. The dev control panel (`/api/v1/dev/control`) simulates fault
+conditions against the live backend for testing; it does not fabricate metrics.
 
 ## Project structure
 

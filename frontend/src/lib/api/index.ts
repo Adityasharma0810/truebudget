@@ -30,7 +30,11 @@ export function getTransport(): Transport {
 }
 export const transport = new Proxy({} as Transport, {
   get(_target, prop) {
-    return (currentTransport as any)[prop];
+    const value = (currentTransport as any)[prop];
+    // Bind methods to the live transport. Without this, `this` would be the
+    // proxy target, so instance state (socket, subscribers) is read back as
+    // undefined and the WebSocket cannot be set up.
+    return typeof value === "function" ? value.bind(currentTransport) : value;
   },
 });
 const schemas: Record<string, z.ZodType> = {

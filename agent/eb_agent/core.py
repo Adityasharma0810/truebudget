@@ -27,13 +27,24 @@ import struct
 import subprocess
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
-from eb_agent.classifier import ClassifierResult, FlowClassifier, get_classifier, rule_classify
+import numpy as np
+
+from eb_agent.classifier import (
+    CLASS_LABELS,
+    ClassifierResult,
+    FlowClassifier,
+    get_classifier,
+    rule_classify,
+)
 from eb_agent.config import AgentConfig
 from eb_agent.decision_log import DecisionLog
+from eb_agent.demand import DemandForecaster
 from eb_agent.estimator import CUSUMDetector, KalmanEstimator, step_change_detected
+from eb_agent.forecaster import Forecast, ForecasterGate, HoltWintersForecaster
 from eb_agent.intents import IntentService
 from eb_agent.policy import FlowDemand, PolicyState, max_min_allocate
 from eb_agent.qoe_server import (
@@ -152,12 +163,14 @@ def _parse_ss_output(text: str, protocol: str) -> list[dict]:
         received = re.search(r"bytes_received:(\d+)", metrics)
         retrans = re.search(r"retrans:\d+/(\d+)", metrics)
         segs_out = re.search(r"segs_out:(\d+)", metrics)
+        segs_in = re.search(r"segs_in:(\d+)", metrics)
         record["rtt_ms"] = float(rtt.group(1)) if rtt else 0.0
         record["jitter_ms"] = float(rtt.group(2)) if rtt else 0.0
         record["bytes_sent"] = int(sent.group(1)) if sent else 0
         record["bytes_received"] = int(received.group(1)) if received else 0
         record["retransmits"] = int(retrans.group(1)) if retrans else 0
         record["segs_out"] = int(segs_out.group(1)) if segs_out else 0
+        record["segs_in"] = int(segs_in.group(1)) if segs_in else 0
         record["loss_pct"] = (
             round(record["retransmits"] / record["segs_out"] * 100.0, 3)
             if record["segs_out"]
@@ -258,6 +271,11 @@ class Snapshot:
     decisions: list[dict] = field(default_factory=list)
     intents: list[dict] = field(default_factory=list)
     emulated: bool = False
+    forecast: list[dict] = field(default_factory=list)
+    forecast_method: str = "unavailable"
+    forecast_confidence: float = 0.0
+    forecast_gate: dict = field(default_factory=dict)
+    demand_forecast: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -318,9 +336,43 @@ class AgentCore:
         self._last_slow_ms = 0.0
         self._last_quality = (0.0, 0.0, 0.0)
         self._last_queue_pkts = 0
+        self._last_queue_bytes = 0
         self._last_policy_signature: tuple | None = None
         self._last_policy_qoe: float | None = None
         self._last_policy_capacity: float | None = None
+        # --- forecasting / demand ML state (fed by real measurements) ---
+        self.forecaster = HoltWintersForecaster(seasonal_periods=12)
+        self.forecast_gate = ForecasterGate(
+            confidence_threshold=config.forecaster_confidence_threshold
+        )
+        self.demand_forecaster = DemandForecaster(alpha=0.3)
+        self._capacity_samples: deque[float] = deque(maxlen=288)
+        self._capacity_forecast: Forecast | None = None
+        self._forecast_method = "unavailable"
+        self._forecast_confidence = 0.0
+        self._forecast_error: float | None = None
+        self._forecast_gate_result = None
+        self._forecast_updated = 0.0
+        self._demand_forecasts: list[dict] = []
+        # --- classifier inference provenance ---
+        self._inference_totals = {"ml": 0, "rule": 0}
+        self._inference_last = {"ml": 0, "rule": 0}
+        self._inference_by_class: dict[str, int] = {}
+        self._inference_last_ts: float | None = None
+        self._last_classifier_method = "rule"
+        # Shadow inference: what the model would have said even when its
+        # confidence is below the acceptance threshold and the rule baseline
+        # answers instead.  This makes the model's real live behaviour visible
+        # without letting low-confidence guesses drive decisions.
+        self._shadow_totals = {
+            "evaluated": 0,
+            "accepted": 0,
+            "belowThreshold": 0,
+            "domainGuard": 0,
+            "untrained": 0,
+        }
+        self._shadow_last = dict(self._shadow_totals)
+        self._shadow_by_class: dict[str, int] = {}
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -328,6 +380,7 @@ class AgentCore:
         if self._running:
             return
         self._running = True
+        self._seed_capacity_samples()
         if self.intent_service:
             await self.intent_service.start()
         self._slow_task = asyncio.create_task(self._slow_loop())
@@ -367,6 +420,228 @@ class AgentCore:
             elapsed = time.monotonic() - start
             await asyncio.sleep(max(0.0, self.config.slow_interval_s - elapsed))
 
+    # ------------------------------------------------------------------ forecasting
+
+    def _seed_capacity_samples(self) -> None:
+        """Warm the forecaster from persisted capacity history after a restart."""
+
+        try:
+            rows = self.store.execute(
+                "SELECT capacity_mbps FROM capacity_history ORDER BY ts DESC LIMIT 288"
+            ).fetchall()
+        except Exception:  # noqa: BLE001 - forecasting must not block startup
+            rows = []
+        for row in reversed(rows):
+            value = row["capacity_mbps"]
+            if value is not None:
+                self._capacity_samples.append(float(value))
+
+    @staticmethod
+    def _mape(actual: Sequence[float], predicted: Sequence[float]) -> float:
+        pairs = [
+            (float(a), float(p))
+            for a, p in zip(actual, predicted)
+            if abs(float(a)) > 1e-9
+        ]
+        if not pairs:
+            return 1.0
+        return sum(abs(a - p) / abs(a) for a, p in pairs) / len(pairs)
+
+    @staticmethod
+    def _holt_winters(
+        samples: Sequence[float], steps: int
+    ) -> Forecast | None:
+        usable = list(samples)
+        if len(usable) < 8:
+            return None
+        seasonal = min(12, max(2, len(usable) // 2))
+        model = HoltWintersForecaster(seasonal_periods=seasonal)
+        if not model.fit(usable):
+            return None
+        return model.predict(steps)
+
+    def _update_capacity_forecast(self, now: float, estimate) -> Forecast | None:
+        """Fit the capacity forecaster on measured history and gate the result."""
+
+        if estimate is not None and estimate.capacity_mbps is not None:
+            self._capacity_samples.append(float(estimate.capacity_mbps))
+        samples = list(self._capacity_samples)
+        interval = max(1.0, float(self.config.slow_interval_s))
+        steps = 12
+        forecast: Forecast | None = None
+        method = "unavailable"
+        confidence = 0.0
+        error: float | None = None
+
+        recent = samples[-min(60, len(samples)) :]
+        if len(recent) >= 4:
+            x = np.arange(len(recent), dtype=float)
+            y = np.asarray(recent, dtype=float)
+            slope, intercept = np.polyfit(x, y, 1)
+            fitted = intercept + slope * x
+            residual = float(np.std(y - fitted))
+            mean = float(np.mean(y)) or 1.0
+            cv = residual / mean
+            predicted = [max(0.0, intercept + slope * (len(recent) + i)) for i in range(steps)]
+            sigma = max(0.25, residual)
+            forecast = Forecast(
+                timesteps=[now + (i + 1) * interval for i in range(steps)],
+                capacity_mbps=predicted,
+                lo_mbps=[max(0.0, value - 1.96 * sigma) for value in predicted],
+                hi_mbps=[value + 1.96 * sigma for value in predicted],
+                confidence=float(np.clip(0.35 + 0.35 * min(1.0, len(samples) / 48) - cv, 0.05, 0.72)),
+                method="linear_trend",
+            )
+            method = "linear_trend"
+            confidence = forecast.confidence
+            error = cv
+
+        if len(samples) >= 24:
+            # Backtest a four-step holdout before trusting Holt-Winters, then
+            # refit on all measurements for the published forecast.
+            if len(samples) >= 28:
+                backtest = self._holt_winters(samples[:-4], 4)
+                if backtest is not None and len(backtest.capacity_mbps) == 4:
+                    error = self._mape(samples[-4:], backtest.capacity_mbps)
+            hw = self._holt_winters(samples, steps)
+            if hw is not None:
+                hw.timesteps = [now + (i + 1) * interval for i in range(len(hw.capacity_mbps))]
+                base = 0.45 + 0.35 * min(1.0, len(samples) / 96)
+                hw.confidence = float(
+                    np.clip(base - (error if error is not None else 0.15) * 0.8, 0.05, 0.92)
+                )
+                hw.method = "holt_winters"
+                forecast = hw
+                method = "holt_winters"
+                confidence = hw.confidence
+
+        if forecast is None:
+            # Too little history for a trend; persistence is still honest output.
+            mean = float(np.mean(recent)) if recent else 0.0
+            forecast = Forecast(
+                timesteps=[now + (i + 1) * interval for i in range(steps)],
+                capacity_mbps=[mean] * steps,
+                lo_mbps=[max(0.0, mean * 0.5)] * steps,
+                hi_mbps=[mean * 1.5] * steps,
+                confidence=0.1 if recent else 0.0,
+                method="persistence",
+            )
+            method = "persistence"
+            confidence = forecast.confidence
+            error = 1.0
+
+        forecast.method = method
+        forecast.confidence = round(confidence, 3)
+        self._capacity_forecast = forecast
+        self._forecast_method = method
+        self._forecast_confidence = forecast.confidence
+        self._forecast_error = round(error, 4) if error is not None else None
+        self._forecast_updated = now
+        self._forecast_gate_result = self.forecast_gate.evaluate(
+            forecast, error if error is not None else 1.0
+        )
+
+        # Persist the next-step forecast next to the capacity measurements.
+        if forecast.capacity_mbps:
+            self.store.execute(
+                "INSERT INTO forecasts(ts, horizon_s, capacity_mbps, lo_mbps, hi_mbps, "
+                "confidence, method) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    now,
+                    interval,
+                    float(forecast.capacity_mbps[0]),
+                    float(forecast.lo_mbps[0]),
+                    float(forecast.hi_mbps[0]),
+                    float(forecast.confidence),
+                    method,
+                ),
+            )
+            self.store.commit()
+        return forecast
+
+    def _update_demand_forecast(self, flows: Sequence[dict]) -> list[dict]:
+        """Observe per-class measured demand and publish EWMA forecasts."""
+
+        observed = {label: 0.0 for label in CLASS_LABELS}
+        for flow in flows:
+            traffic_class = str(flow.get("traffic_class", "unknown"))
+            rate = float(flow.get("bytes_per_s", 0.0) or 0.0) * 8.0 / 1_000_000.0
+            observed[traffic_class] = observed.get(traffic_class, 0.0) + rate
+        for traffic_class, rate in observed.items():
+            self.demand_forecaster.observe(traffic_class, rate)
+        horizon = max(5.0, float(self.config.slow_interval_s) * 4)
+        forecasts = self.demand_forecaster.forecast_all(horizon_s=horizon)
+        self._demand_forecasts = [
+            {
+                "trafficClass": f.traffic_class,
+                "horizonSeconds": f.horizon_s,
+                "predictedMbps": round(f.predicted_mbps, 4),
+                "confidence": round(f.confidence, 3),
+                "samples": f.samples,
+                "method": "ewma",
+            }
+            for f in sorted(forecasts.values(), key=lambda f: -f.predicted_mbps)
+        ]
+        return self._demand_forecasts
+
+    def _forecast_points(self) -> list[dict]:
+        forecast = self._capacity_forecast
+        if forecast is None:
+            return []
+        return [
+            {
+                "ts": float(forecast.timesteps[i]),
+                "mbps": round(float(forecast.capacity_mbps[i]), 3),
+                "lo": round(float(max(0.0, forecast.lo_mbps[i])), 3),
+                "hi": round(float(forecast.hi_mbps[i]), 3),
+            }
+            for i in range(len(forecast.capacity_mbps))
+        ]
+
+    @property
+    def forecast_state(self) -> dict:
+        gate = self._forecast_gate_result
+        return {
+            "method": self._forecast_method,
+            "confidence": round(self._forecast_confidence, 3),
+            "error": self._forecast_error,
+            "updatedAt": self._forecast_updated,
+            "gate": {
+                "useForecast": bool(gate.use_forecast) if gate else False,
+                "reason": gate.reason if gate else "forecast_unavailable",
+                "threshold": float(self.forecast_gate.confidence_threshold),
+            },
+            "next": self._forecast_points()[:4],
+            "samples": len(self._capacity_samples),
+        }
+
+    @property
+    def demand_state(self) -> dict:
+        return {
+            "forecasts": list(self._demand_forecasts),
+            "updatedAt": self._forecast_updated,
+            "horizonSeconds": max(5.0, float(self.config.slow_interval_s) * 4),
+        }
+
+    @property
+    def inference_state(self) -> dict:
+        total = self._inference_totals["ml"] + self._inference_totals["rule"]
+        return {
+            "last": dict(self._inference_last),
+            "totals": dict(self._inference_totals),
+            "total": total,
+            "byClass": dict(self._inference_by_class),
+            "lastAt": self._inference_last_ts,
+            "model": self.classifier.model_kind or "rule_baseline",
+            "trained": self.classifier.is_trained,
+            "threshold": float(self.classifier.threshold),
+            "shadow": {
+                "last": dict(self._shadow_last),
+                "totals": dict(self._shadow_totals),
+                "byClass": dict(self._shadow_by_class),
+            },
+        }
+
     async def _slow_tick(self) -> None:
         rid = request_id()
         now = time.time()
@@ -380,6 +655,11 @@ class AgentCore:
 
         # 3. Estimate link capacity (Kalman) from real interface throughput probes.
         estimate = self._estimate_capacity(now)
+
+        # 3b. Fit capacity forecast (Holt-Winters when enough history, linear
+        # fallback otherwise) and per-class demand forecasts (EWMA).
+        self._update_capacity_forecast(now, estimate)
+        demand_forecasts = self._update_demand_forecast(flows)
 
         # 4. Compute per-flow / per-device QoE from real measurements.
         qoe = self._compute_qoe(devices, flows, estimate, now)
@@ -402,6 +682,11 @@ class AgentCore:
             decisions=self._recent_decisions(),
             intents=active_intents,
             emulated=self.emulated,
+            forecast=self._forecast_points(),
+            forecast_method=self._forecast_method,
+            forecast_confidence=self._forecast_confidence,
+            forecast_gate=self.forecast_state["gate"],
+            demand_forecast=demand_forecasts,
         )
         self._last_snapshot = snapshot
         self._last_tick = None
@@ -538,7 +823,12 @@ class AgentCore:
 
         Works without root on Linux and gives per-connection throughput,
         retransmits and RTT for flows owned by this host.  Returns the raw
-        records plus the number of packets currently queued in send buffers.
+        records plus the number of packets implied by queued *bytes*.
+
+        ``ss`` reports send/recv queue fill in bytes, not packets.  We keep the
+        real byte count and convert with the standard 1448-byte TCP payload
+        (documented approximation) so the UI label "packets" is not a
+        mislabelled byte counter.
         """
         records: list[dict] = []
         for args, protocol in ((["ss", "-tinp"], "tcp"), (["ss", "-uinp"], "udp")):
@@ -553,7 +843,7 @@ class AgentCore:
 
         now = time.time()
         flows: list[dict] = []
-        queue_pkts = 0
+        queue_bytes = 0
         active_ids: set[str] = set()
         for record in records:
             src_ip = record.get("src_ip", "")
@@ -564,7 +854,8 @@ class AgentCore:
                 continue
             if dst_ip.startswith("169.254.") or dst_ip.startswith("fe80:"):
                 continue
-            queue_pkts += int(record.get("send_q", 0)) + int(record.get("recv_q", 0))
+            flow_queue_bytes = int(record.get("send_q", 0)) + int(record.get("recv_q", 0))
+            queue_bytes += flow_queue_bytes
             flow_id = (
                 f"sock-{record['protocol']}-{src_ip}:{record.get('src_port', 0)}"
                 f"-{dst_ip}:{record.get('dst_port', 0)}"
@@ -586,6 +877,10 @@ class AgentCore:
             self._socket_samples[flow_id] = (now, total, first_seen)
             sent = int(record.get("bytes_sent", 0))
             received = int(record.get("bytes_received", 0))
+            segs_out = int(record.get("segs_out", 0) or 0)
+            segs_in = int(record.get("segs_in", 0) or 0)
+            total_packets = segs_out + segs_in
+            duration_s = max(1.0, now - first_seen)
             direction_ratio = sent / (sent + received) if (sent + received) else 0.5
             flows.append(
                 {
@@ -599,12 +894,22 @@ class AgentCore:
                     "bytes_per_s": bytes_per_s,
                     "bytes_sent": sent,
                     "bytes_received": received,
+                    "segs_out": segs_out,
+                    "segs_in": segs_in,
+                    "pkt_len_mean": round((sent + received) / total_packets, 2)
+                    if total_packets
+                    else 0.0,
+                    "packets_per_s": round(total_packets / duration_s, 3),
+                    "iat_mean_ms": round(duration_s * 1000.0 / total_packets, 3)
+                    if total_packets
+                    else 0.0,
                     "rtt_ms": float(record.get("rtt_ms", 0.0) or 0.0),
                     "jitter_ms": float(record.get("jitter_ms", 0.0) or 0.0),
                     "loss_pct": float(record.get("loss_pct", 0.0) or 0.0),
                     "retransmits": int(record.get("retransmits", 0) or 0),
+                    "queue_bytes": flow_queue_bytes,
                     "direction_ratio": direction_ratio,
-                    "duration_s": max(1.0, now - first_seen),
+                    "duration_s": duration_s,
                     "first_seen": first_seen,
                     "last_seen": now,
                 }
@@ -612,13 +917,17 @@ class AgentCore:
         for flow_id in list(self._socket_samples):
             if flow_id not in active_ids:
                 del self._socket_samples[flow_id]
+        queue_pkts = int(np.ceil(queue_bytes / 1448.0)) if queue_bytes else 0
         self._last_queue_pkts = queue_pkts
+        self._last_queue_bytes = queue_bytes
         return flows, queue_pkts
 
 
     def _gather_and_classify_flows(self, devices: list[dict]) -> list[dict]:
         """Gather real flow features from sockets + conntrack, then classify."""
         now = time.time()
+        self._inference_last = {"ml": 0, "rule": 0}
+        self._shadow_last = {key: 0 for key in self._shadow_totals}
         candidates: list[dict] = []
 
         # Per-socket measurements (works for traffic owned by this host).
@@ -641,11 +950,18 @@ class AgentCore:
                 bytes_per_s = 0.0
                 first_seen = now
             self._conntrack_samples[flow_id] = (now, total, first_seen)
+            packets = int(cf.get("packets", 0) or 0)
+            duration_s = max(1.0, now - first_seen)
             cf.update(
                 {
                     "flow_id": flow_id,
                     "bytes_per_s": bytes_per_s,
-                    "duration_s": max(1.0, now - first_seen),
+                    "packets_per_s": round(packets / duration_s, 3),
+                    "iat_mean_ms": round(duration_s * 1000.0 / packets, 3)
+                    if packets
+                    else 0.0,
+                    "pkt_len_mean": round(total / packets, 2) if packets else 0.0,
+                    "duration_s": duration_s,
                     "first_seen": first_seen,
                     "last_seen": now,
                     "direction_ratio": 0.5,
@@ -677,11 +993,36 @@ class AgentCore:
                 "direction_ratio": float(cf.get("direction_ratio", 0.5)),
                 "bytes_per_s": float(cf.get("bytes_per_s", 0.0)),
                 "duration_s": float(cf.get("duration_s", 1.0)),
-                "burstiness": float(cf.get("burstiness", 0.0) or 0.0),
                 "pkt_len_mean": float(cf.get("pkt_len_mean", 0.0) or 0.0),
-                "iat_mean": float(cf.get("iat_mean", 10.0) or 10.0),
+                "packets_per_s": float(cf.get("packets_per_s", 0.0) or 0.0),
+                "iat_mean_ms": float(cf.get("iat_mean_ms", 0.0) or 0.0),
             }
             result: ClassifierResult = self.classifier.predict(features)
+            method = result.method if result.method in ("ml", "rule") else "rule"
+            self._inference_last[method] += 1
+            self._inference_totals[method] += 1
+            self._inference_by_class[result.predicted_class] = (
+                self._inference_by_class.get(result.predicted_class, 0) + 1
+            )
+            if result.model_evaluated:
+                self._shadow_last["evaluated"] += 1
+                self._shadow_totals["evaluated"] += 1
+                if method == "ml":
+                    self._shadow_last["accepted"] += 1
+                    self._shadow_totals["accepted"] += 1
+                else:
+                    self._shadow_last["belowThreshold"] += 1
+                    self._shadow_totals["belowThreshold"] += 1
+                if result.model_class:
+                    self._shadow_by_class[result.model_class] = (
+                        self._shadow_by_class.get(result.model_class, 0) + 1
+                    )
+            else:
+                reason = result.model_skip_reason or "untrained"
+                key = "domainGuard" if reason == "domain_guard" else "untrained"
+                self._shadow_last[key] += 1
+                self._shadow_totals[key] += 1
+            self._last_classifier_method = method
             flows.append(
                 {
                     **cf,
@@ -689,10 +1030,15 @@ class AgentCore:
                     "device_id": device_id,
                     "traffic_class": result.predicted_class,
                     "confidence": result.confidence,
-                    "method": result.method,
+                    "method": method,
+                    "model_class": result.model_class,
+                    "model_confidence": round(float(result.model_confidence), 4)
+                    if result.model_evaluated
+                    else None,
                     "bytes_per_s": features["bytes_per_s"],
                 }
             )
+        self._inference_last_ts = now
         return flows
 
     def _read_conntrack_flows(self) -> list[dict]:
@@ -881,6 +1227,7 @@ class AgentCore:
             "jitter_ms": jitter_ms,
             "loss_pct": loss_pct,
             "queue_pkts": self._last_queue_pkts,
+            "queue_bytes": self._last_queue_bytes,
             "throughput_mbps": self._last_throughput_mbps,
         }
 
@@ -975,11 +1322,34 @@ class AgentCore:
                     weight=1.0,
                 )
             )
-        policy = max_min_allocate(demands, capacity, state=self.policy_state)
+        # The forecast gate decides whether a near-term capacity dip may reduce
+        # the capacity the allocator plans against.  When the gate is in
+        # fallback the allocator uses the live estimate only.
+        planning_capacity = capacity
+        forecast_used = False
+        gate = self._forecast_gate_result
+        if (
+            gate is not None
+            and gate.use_forecast
+            and self._capacity_forecast is not None
+            and self._capacity_forecast.capacity_mbps
+        ):
+            horizon = self._capacity_forecast.capacity_mbps[:4]
+            planning_capacity = min(capacity, max(0.1, min(horizon)))
+            forecast_used = planning_capacity < capacity - 0.01
+        policy = max_min_allocate(demands, planning_capacity, state=self.policy_state)
+        rationale = policy.rationale
+        if forecast_used:
+            rationale += (
+                f" Forecast gate active: planning capacity {planning_capacity:.2f} Mbps "
+                f"(live estimate {capacity:.2f} Mbps)."
+            )
         return {
             "cake_bandwidth_mbit": policy.cake_bandwidth_mbit,
             "infeasible": policy.infeasible,
-            "rationale": policy.rationale,
+            "rationale": rationale,
+            "planning_capacity_mbps": round(planning_capacity, 3),
+            "forecast_used": forecast_used,
             "worst_device_qoe": policy.worst_device_qoe,
             "jain_index": policy.jain_index,
             "starvation_count": policy.starvation_count,
@@ -1043,6 +1413,33 @@ class AgentCore:
                 "jain": qoe.get("jain"),
                 "rtt_ms": qoe.get("rtt_ms"),
                 "loss_pct": qoe.get("loss_pct"),
+                "forecast": {
+                    "method": self._forecast_method,
+                    "confidence": self._forecast_confidence,
+                    "gate": (
+                        self._forecast_gate_result.reason
+                        if self._forecast_gate_result
+                        else "forecast_unavailable"
+                    ),
+                    "gateActive": bool(
+                        self._forecast_gate_result
+                        and self._forecast_gate_result.use_forecast
+                    ),
+                    "planningCapacityMbps": policy.get("planning_capacity_mbps"),
+                    "used": bool(policy.get("forecast_used")),
+                },
+                "inference": {
+                    "model": self.classifier.model_kind or "rule_baseline",
+                    "trained": self.classifier.is_trained,
+                    "lastTickMl": self._inference_last.get("ml", 0),
+                    "lastTickRule": self._inference_last.get("rule", 0),
+                    "lastTickEvaluated": self._shadow_last.get("evaluated", 0),
+                    "lastTickBelowThreshold": self._shadow_last.get(
+                        "belowThreshold", 0
+                    ),
+                    "modelsEvaluatedTotal": self._shadow_totals.get("evaluated", 0),
+                    "modelsAcceptedTotal": self._shadow_totals.get("accepted", 0),
+                },
             },
             verdict="kept",
         )
@@ -1147,6 +1544,7 @@ class AgentCore:
             ("jitter_ms", qoe.get("jitter_ms", 0.0), "ping"),
             ("loss_pct", qoe.get("loss_pct", 0.0), "ping"),
             ("queue_pkts", qoe.get("queue_pkts", 0), "ss"),
+            ("queue_bytes", qoe.get("queue_bytes", 0), "ss"),
             ("fairness", qoe.get("jain", 1.0), "qoe"),
         ):
             if value is None:

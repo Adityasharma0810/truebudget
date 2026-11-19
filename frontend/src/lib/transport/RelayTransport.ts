@@ -23,6 +23,7 @@ export class RelayTransport implements Transport {
   private pairingKey: string | null = null;
   private connected = false;
   private started = false;
+  private sessionId: string | null = null;
 
   constructor() {
     const base = import.meta.env?.VITE_RELAY_URL || "ws://localhost:7443";
@@ -33,6 +34,7 @@ export class RelayTransport implements Transport {
   async request(method: string, path: string, body?: unknown): Promise<unknown> {
     const url = this._apiUrl(path);
     const headers = new Headers();
+    if (this.sessionId) headers.set("X-EB-Session", this.sessionId);
     const opts: RequestInit = { method, headers };
     if (body !== undefined) {
       headers.set("Content-Type", "application/json");

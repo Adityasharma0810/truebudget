@@ -54,6 +54,7 @@ import type {
   LogEntry,
   Settings,
   Snapshot,
+  DemandForecast,
 } from "../../types";
 export function CapabilityGate({ flag, children }: { flag: string; children: ReactNode }) {
   const { capabilities } = useConsole();
@@ -250,6 +251,7 @@ export function Health() {
 export function Demand() {
   const { snapshot, settings } = useConsole();
   const query = useApi<Schedule[]>("/demand/schedules");
+  const forecast = useApi<DemandForecast>("/demand/forecast", { refetchInterval: 5000 });
   const [add, setAdd] = useState(false);
   const [name, setName] = useState("");
   const [device, setDevice] = useState(snapshot.devices[0]?.name ?? "");
@@ -267,6 +269,51 @@ export function Demand() {
           <Plus size={14} /> Add schedule
         </Button>
       </SectionHeading>
+      <section className="card demand-forecast-card">
+        <CardHeader
+          title="Live demand forecast"
+          subtitle={
+            forecast.data
+              ? `${forecast.data.method} · ${Math.round(forecast.data.horizonSeconds)}s horizon`
+              : "Fitting on measured per-class bytes/s"
+          }
+        >
+          <Badge tone={forecast.data?.learning ? "blue" : "emulated"}>
+            {forecast.data?.learning ? "Learning enabled" : "Learning paused"}
+          </Badge>
+        </CardHeader>
+        {forecast.error ? (
+          <ErrorState message={forecast.error.message} retry={() => void forecast.refetch()} />
+        ) : !forecast.data ? (
+          <Skeletons />
+        ) : (
+          <>
+            <div className="demand-forecast-grid">
+              {forecast.data.classes.map((item) => (
+                <div className="demand-forecast-item" key={item.trafficClass}>
+                  <div className="row-between">
+                    <strong>{item.trafficClass}</strong>
+                    <span>{item.predictedMbps.toFixed(2)} Mbps</span>
+                  </div>
+                  <ProgressBar value={item.confidence} />
+                  <span className="field-hint">
+                    {percent(item.confidence)} confidence · {item.samples} observations
+                  </span>
+                </div>
+              ))}
+            </div>
+            <p className="field-hint demand-forecast-note">
+              Predictions derive from measured bytes/s on this agent.{" "}
+              {forecast.data.learning
+                ? "Schedules use the current model confidence."
+                : "Enable demand learning above to let schedules use the model confidence."}{" "}
+              {forecast.data.updatedAt
+                ? `Updated ${dateTime(forecast.data.updatedAt)}.`
+                : "Waiting for the first control tick."}
+            </p>
+          </>
+        )}
+      </section>
       <section className="card demand-learning">
         <span>
           <CalendarClock size={24} />
@@ -578,26 +625,33 @@ export function Agent() {
                 subtitle="Revoke anything you don’t recognize."
               />
               <div className="session-list">
-                {sessions.data?.map((s) => (
-                  <div className="session-row" key={s.id}>
-                    <span className="session-icon">
-                      <GlobeIcon />
-                    </span>
-                    <div>
-                      <h3>
-                        {s.name} {s.current && <Badge tone="blue">This session</Badge>}
-                      </h3>
-                      <p>
-                        {s.location} · {s.lastSeen}
-                      </p>
+                {sessions.data?.length ? (
+                  sessions.data.map((s) => (
+                    <div className="session-row" key={s.id}>
+                      <span className="session-icon">
+                        <GlobeIcon />
+                      </span>
+                      <div>
+                        <h3>
+                          {s.name} {s.current && <Badge tone="blue">This client</Badge>}
+                        </h3>
+                        <p>
+                          {s.location} · {s.lastSeen}
+                        </p>
+                      </div>
+                      {!s.current && (
+                        <Button variant="ghost" onClick={() => setConfirm(s.id)}>
+                          Revoke
+                        </Button>
+                      )}
                     </div>
-                    {!s.current && (
-                      <Button variant="ghost" onClick={() => setConfirm(s.id)}>
-                        Revoke
-                      </Button>
-                    )}
-                  </div>
-                ))}
+                  ))
+                ) : (
+                  <EmptyState
+                    title="No live console sessions."
+                    description="A session appears when a browser opens the live stream. Revoking one closes that stream immediately."
+                  />
+                )}
               </div>
             </section>
             <section className="card pairing-security">
@@ -617,8 +671,8 @@ export function Agent() {
                 </button>
               </div>
               <p>
-                Rotate your key if it may have been exposed. This is a local emulation; no real
-                agent credentials are changed.
+                Rotate your key if it may have been exposed. This generates a new single-use local
+                pairing secret; local read-only access does not require it in this build.
               </p>
               <div className="key-actions">
                 <Button variant="secondary" onClick={() => setConfirm("rotate")}>
@@ -672,8 +726,8 @@ export function Agent() {
       >
         <p className="dialog-description">
           {confirm === "rotate"
-            ? "The previous demo key will be invalidated. A new key will be shown once, masked by default."
-            : "This session will lose access to the agent. This browser remains connected."}
+            ? "The previous local pairing secret hash will be replaced. A new key will be shown once, masked by default."
+            : "This session is revoked and its live stream is closed. Other streams are unaffected."}
         </p>
         <div className="modal-footer">
           <Button variant="secondary" onClick={() => setConfirm(null)}>

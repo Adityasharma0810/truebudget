@@ -4,7 +4,7 @@
 |---|---|
 | **Project** | Experience Budget (EB) — intent-aware adaptive QoS/QoE controller for home broadband |
 | **Version of this plan** | 1.0 (2026-11-15) |
-| **Status** | ACTIVE — Phase 0 groundwork in progress; G0 has not passed. Work top-to-bottom and keep the repo runnable after every phase. |
+| **Status** | LIVE LOCAL VALIDATION — agent and console are wired to real telemetry; synthetic data is confined to the lab; host enforcement is not enabled. |
 | **Working dir** | `/home/vboxuser/Desktop/truebudget` (Linux) |
 | **Rule** | Never claim a feature is done unless it has a passing test or a reproducible demo command. |
 
@@ -37,6 +37,9 @@ Browser (website) <-- pairing key/link --> relay (or direct LAN) <--> agent
 
 ## 2. Ground-truth audit (2026-11-15)
 
+> **Historical snapshot.** Sections 2.1–2.2 describe the repository before the
+> local agent wiring landed. See §2.3 for current status.
+
 ### 2.1 What exists
 
 | Area | State | Files |
@@ -64,6 +67,27 @@ Browser (website) <-- pairing key/link --> relay (or direct LAN) <--> agent
 9. **Dev machine is Windows** — netns/tc gates run in CI (privileged Docker) and/or WSL2; local Windows loop uses mock + Docker lab profile.
 
 ---
+
+### 2.3 Current status (2026-11-19)
+
+- **Console transport:** `RelayTransport` connects to the agent's real API and
+  WebSocket stream; `DirectTransport` targets an HTTPS LAN host. There is no
+  browser-local mock transport in `frontend/src`.
+- **Live agent data:** snapshot, metrics history, flows, devices, QoE, capacity,
+  policy decisions, intents, conflicts, health, sessions, settings, ML metrics,
+  demand forecasts, and the decision hash chain all come from the running agent.
+- **ML:** the classifier trains locally at startup when no artifact exists,
+  persists versioned joblib artifacts, reports holdout accuracy/F1/baseline/
+  confusion matrix, and records live ML-vs-rule inference counts. Model versions
+  can be retrained and rolled back from the UI. Training data is the deterministic
+  lab generator (plus approved corrections) and is labelled synthetic.
+- **Forecasting:** capacity uses Holt-Winters when enough measured history exists,
+  otherwise a linear-trend or persistence fallback, with a confidence gate that
+  can feed planning capacity. Per-class demand uses EWMA over measured bytes/s.
+- **Honest limitations:** no qdisc is changed by this build (`shaping: false`);
+  Windows/macOS/OpenWrt host shaping is not available; multi-link failover needs a
+  second real WAN; federated learning remains feature-flagged; upstream router and
+  two-device hardware acceptance have not been run here.
 
 ## 3. Locked architectural decisions
 

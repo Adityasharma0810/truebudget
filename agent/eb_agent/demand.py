@@ -6,6 +6,8 @@ engine can preemptively reserve headroom before congestion.
 
 from __future__ import annotations
 
+import statistics
+from collections import deque
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -24,10 +26,12 @@ class DemandForecast:
 class DemandForecaster:
     """Simple EWMA-based demand forecaster per traffic class."""
 
-    def __init__(self, alpha: float = 0.3) -> None:
+    def __init__(self, alpha: float = 0.3, history: int = 20) -> None:
         self.alpha = alpha
         self._ewma: dict[str, float] = {}
         self._counts: dict[str, int] = {}
+        self._history: dict[str, deque[float]] = {}
+        self._history_len = max(2, history)
 
     def observe(self, traffic_class: str, rate_mbps: float) -> None:
         prev = self._ewma.get(traffic_class, rate_mbps)
@@ -35,16 +39,34 @@ class DemandForecaster:
             self.alpha * rate_mbps + (1.0 - self.alpha) * prev
         )
         self._counts[traffic_class] = self._counts.get(traffic_class, 0) + 1
+        history = self._history.setdefault(
+            traffic_class, deque(maxlen=self._history_len)
+        )
+        history.append(max(0.0, float(rate_mbps)))
 
     def forecast(self, traffic_class: str, horizon_s: float = 30.0) -> DemandForecast:
         ewma = self._ewma.get(traffic_class, 0.0)
         count = self._counts.get(traffic_class, 0)
-        confidence = min(1.0, count / 20.0)  # full confidence after 20 samples
+        recent = list(self._history.get(traffic_class, ()))
+        if count == 0 or not recent:
+            confidence = 0.0
+        elif all(value <= 1e-9 for value in recent):
+            # No demand is a valid observation, but it is not evidence that a
+            # future schedule will be useful.  Keep this low so schedules do
+            # not claim confidence they have not earned.
+            confidence = min(0.25, 0.05 + count * 0.01)
+        else:
+            mean = statistics.fmean(recent)
+            std = statistics.pstdev(recent)
+            cv = std / mean if mean > 0 else 1.0
+            coverage = min(1.0, count / 12.0)
+            stability = 1.0 / (1.0 + cv)
+            confidence = min(0.9, coverage * stability * 0.9)
         return DemandForecast(
             traffic_class=traffic_class,
             horizon_s=horizon_s,
             predicted_mbps=max(0.0, ewma),
-            confidence=confidence,
+            confidence=round(float(confidence), 3),
             samples=count,
         )
 

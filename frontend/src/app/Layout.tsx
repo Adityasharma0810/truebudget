@@ -144,7 +144,9 @@ export function Layout() {
     return () => window.removeEventListener("keydown", handler);
   }, []);
   useEffect(() => {
-    if (notice) useToasts.getState().push(notice);
+    if (!notice) return;
+    useToasts.getState().push(notice);
+    useMotionPreference.setState({ notice: "" });
   }, [notice]);
   useEffect(() => {
     setMobileMenu(false);
@@ -218,7 +220,7 @@ export function Layout() {
             <div className="nav-group" key={group.label}>
               <div className="nav-group-label">{group.label}</div>
               {group.items
-                .filter((item) => !("flag" in item) || cap?.flags[item.flag!])
+                .filter((item) => !("flag" in item) || cap?.flags?.[item.flag!])
                 .map((item) => (
                   <NavLink
                     key={item.path}
@@ -487,7 +489,7 @@ export function BoostDialog({ open, onClose }: { open: boolean; onClose: () => v
           Experience
           <select value={cls} onChange={(e) => setCls(e.target.value)}>
             {capabilities?.classes
-              .filter((c) => c !== "unknown")
+              ?.filter((c) => c !== "unknown")
               .map((c) => (
                 <option key={c} value={c}>
                   {c.charAt(0).toUpperCase() + c.slice(1)}
@@ -570,7 +572,7 @@ function CommandPalette({
     .flatMap((g) => g.items)
     .filter(
       (i) =>
-        (!("flag" in i) || capabilities?.flags[i.flag!]) &&
+        (!("flag" in i) || capabilities?.flags?.[i.flag!]) &&
         i.name.toLowerCase().includes(search.toLowerCase()),
     );
   useEffect(() => setIndex(0), [search]);

@@ -11,6 +11,9 @@ export const FlowSchema = z.object({
   throughputMbps: z.number(),
   features: z.record(z.string(), z.number()),
   baselineCls: TrafficClassSchema.optional(),
+  method: z.enum(["ml", "rule"]).optional(),
+  modelClass: TrafficClassSchema.optional(),
+  modelConfidence: z.number().min(0).max(1).nullable().optional(),
 });
 export const DeviceSchema = z.object({
   id: z.string(),
@@ -50,6 +53,14 @@ export const SnapshotSchema = z.object({
     uncertaintyMbps: z.number(),
     forecast: z.array(ForecastSchema),
     forecastConfidence: z.number(),
+    forecastMethod: z.string().optional(),
+    forecastGate: z
+      .object({
+        useForecast: z.boolean(),
+        reason: z.string(),
+        threshold: z.number(),
+      })
+      .optional(),
   }),
   household: z.object({
     qoe: z.number().nullable(),
@@ -63,6 +74,7 @@ export const SnapshotSchema = z.object({
     lossPct: z.number(),
     throughputMbps: z.number(),
     queueDepthPkts: z.number(),
+    queueDepthBytes: z.number().optional(),
   }),
   alerts: z.array(AlertSchema),
   scenario: z.string().nullable(),
@@ -190,6 +202,8 @@ export interface Experiment {
   trials: number;
   progress: number;
   status: string;
+  error?: string | null;
+  emulated?: boolean;
   results: {
     metric: string;
     unit: string;
@@ -218,11 +232,62 @@ export interface MLData {
   accuracy: number | null;
   f1: number | null;
   baseline: number | null;
+  baselineF1?: number | null;
   encrypted: number | null;
   matrix: number[][];
   labels: string[];
+  trained?: boolean;
+  modelKind?: string;
+  trainingSource?: string;
+  trainingNote?: string;
+  trainedAt?: string | null;
+  nTrain?: number | null;
+  nTest?: number | null;
+  inference?: {
+    lastTickMl: number;
+    lastTickRule: number;
+    totalMl: number;
+    totalRule: number;
+    byClass: Record<string, number>;
+    lastAt: string | null;
+    threshold?: number;
+    shadow?: {
+      last: {
+        evaluated: number;
+        accepted: number;
+        belowThreshold: number;
+        domainGuard: number;
+        untrained: number;
+      };
+      totals: {
+        evaluated: number;
+        accepted: number;
+        belowThreshold: number;
+        domainGuard: number;
+        untrained: number;
+      };
+      byClass: Record<string, number>;
+    };
+  };
   models: { version: string; status: string; accuracy: number | null; date: string }[];
   corrections: Correction[];
+}
+export interface DemandForecastClass {
+  trafficClass: string;
+  horizonSeconds: number;
+  predictedMbps: number;
+  confidence: number;
+  samples: number;
+  method: string;
+}
+export interface DemandForecast {
+  classes: DemandForecastClass[];
+  horizonSeconds: number;
+  capacityMbps: number | null;
+  method: string;
+  learning: boolean;
+  updatedAt: string | null;
+  synthetic: boolean;
 }
 export interface AgentInfo {
   hostname: string;

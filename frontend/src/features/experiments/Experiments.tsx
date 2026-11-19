@@ -29,7 +29,7 @@ export default function Experiments() {
   const { capabilities } = useConsole();
   const [scenario, setScenario] = useState(capabilities?.scenarios[0]?.id ?? "");
   const [seed, setSeed] = useState(capabilities?.seed ?? 4242);
-  const [trials, setTrials] = useState(20);
+  const [trials, setTrials] = useState(3);
   const { data: experiments = [] } = useApi<Experiment[]>("/experiments", {
     refetchInterval: 1000,
   });
@@ -39,13 +39,15 @@ export default function Experiments() {
   const reportTask = useTask<Experiment>("");
   const [format, setFormat] = useState("html");
   const selected = experiments[0];
-  const running = selected?.status === "running";
+  const running = selected?.status === "running" || selected?.status === "queued";
+  const failed = selected?.status === "failed";
+  const completed = selected?.status === "completed";
   const { data: points = [] } = useApi<MetricPoint[]>(
     `/metrics?range=15m&experiment=${selected?.id ?? ""}`,
     { refetchInterval: running ? 3000 : false },
   );
   async function report() {
-    if (!selected) return;
+    if (!selected || !completed) return;
     reportTask.mutate(
       { path: `/experiments/${selected.id}/report`, method: "GET" },
       {
@@ -137,13 +139,23 @@ export default function Experiments() {
         <>
           <section className="card race-card">
             <CardHeader
-              title={running ? "A fair race, in progress." : "The results are in."}
+              title={
+                failed
+                  ? "The experiment didn’t finish."
+                  : running
+                    ? "A fair race, in progress."
+                    : "The results are in."
+              }
               subtitle={`Seed ${selected.seed} · ${selected.trials} paired trials · Emulated capacity trace`}
             >
-              <Badge tone="blue">
+              <Badge tone={failed ? "emulated" : "blue"}>
                 {running
                   ? `${Math.floor((selected.progress / 100) * selected.trials)} / ${selected.trials} trials`
-                  : "Completed"}
+                  : failed
+                    ? "Failed"
+                    : completed
+                      ? "Completed"
+                      : "Queued"}
               </Badge>
             </CardHeader>
             <div className="race-progress">
@@ -182,7 +194,23 @@ export default function Experiments() {
               </div>
             </div>
           </section>
-          {!running && (
+          {failed && (
+            <section className="card results-card">
+              <CardHeader
+                title="The lab harness reported an error"
+                subtitle="No result values were produced, so none are shown."
+              />
+              <div className="report-disclaimer">
+                <Info size={14} /> {selected.error || "The harness exited without an error message."}
+              </div>
+              <p className="muted">
+                The experiment needs a Linux user+network namespace. Try again after checking the
+                lab prerequisites; the agent does not replace failed measurements with invented
+                numbers.
+              </p>
+            </section>
+          )}
+          {completed && (
             <section className="card results-card">
               <CardHeader
                 title="The whole picture, not just a headline"

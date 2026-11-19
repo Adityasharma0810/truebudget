@@ -22,7 +22,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timezone
 from typing import Any, Optional, Sequence
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect, status
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
@@ -32,6 +32,7 @@ from eb_agent.core import AgentCore, Snapshot, Tick
 from eb_agent.decision_log import DecisionLog, GENESIS_HASH
 from eb_agent.health import get_health_service
 from eb_agent.intents import IntentService
+from eb_agent import model_registry
 from eb_agent.negotiation import get_negotiation_service
 from eb_agent.experiments import ExperimentStore, run_experiment
 from eb_agent.qoe_server import qoe_band
@@ -270,6 +271,9 @@ def _snapshot_to_frontend(core: AgentCore, config: AgentConfig, store: Store) ->
                     "throughputMbps": round(
                         float(f.get("bytes_per_s", 0) or 0) * 8.0 / 1_000_000.0, 3
                     ),
+                    "method": f.get("method") or "rule",
+                    "modelClass": f.get("model_class") or None,
+                    "modelConfidence": f.get("model_confidence"),
                     "features": {
                         key: float(f.get(key) or 0.0)
                         for key in (
@@ -326,13 +330,26 @@ def _snapshot_to_frontend(core: AgentCore, config: AgentConfig, store: Store) ->
     if jain is None:
         jain = 1.0
 
+    active_scenario: Optional[str] = None
+    scenario_row = store.execute(
+        "SELECT key, value FROM settings WHERE key LIKE 'scenario:%' "
+        "ORDER BY updated_at DESC LIMIT 1"
+    ).fetchone()
+    if scenario_row:
+        scenario_state = _json_dict(scenario_row["value"])
+        if scenario_state.get("active"):
+            active_scenario = str(
+                scenario_state.get("id") or scenario_row["key"].split(":", 1)[1]
+            )
+
     return {
         "agent": {
             "id": getattr(config, "agent_id", "eb-agent"),
             "name": "Experience Budget Agent",
             "version": APP_VERSION,
             "intervalSeconds": config.slow_interval_s,
-            "capabilities": ["monitoring", "qoe", "policy", "shaping"],
+            # Only capabilities that are actually producing data on this agent.
+            "capabilities": ["monitoring", "qoe", "policy", "classifier", "forecast", "demand"],
             "emulated": bool(snap.emulated),
             "seed": 0,
         },
@@ -341,8 +358,18 @@ def _snapshot_to_frontend(core: AgentCore, config: AgentConfig, store: Store) ->
         "link": {
             "capacityMbps": round(capacity, 2),
             "uncertaintyMbps": round(uncertainty, 2),
-            "forecast": [],
-            "forecastConfidence": 0.0,
+            "forecast": [
+                {
+                    "ts": _iso(float(point["ts"])),
+                    "mbps": round(float(point["mbps"]), 3),
+                    "lo": round(float(point["lo"]), 3),
+                    "hi": round(float(point["hi"]), 3),
+                }
+                for point in (snap.forecast or [])
+            ],
+            "forecastConfidence": round(float(snap.forecast_confidence or 0.0), 3),
+            "forecastMethod": snap.forecast_method or "unavailable",
+            "forecastGate": snap.forecast_gate or {},
         },
         "household": {
             "qoe": round(float(household_qoe), 4) if household_qoe is not None else None,
@@ -356,9 +383,10 @@ def _snapshot_to_frontend(core: AgentCore, config: AgentConfig, store: Store) ->
             "lossPct": round(float(qoe.get("loss_pct", 0.0) or 0.0), 2),
             "throughputMbps": round(throughput, 3),
             "queueDepthPkts": queue_pkts,
+            "queueDepthBytes": int(qoe.get("queue_bytes", 0) or 0),
         },
         "alerts": [],
-        "scenario": None,
+        "scenario": active_scenario,
         "tick": tick_num,
         "connected": True,
     }
@@ -444,6 +472,30 @@ def _intent_out(row: Any) -> dict[str, Any]:
     }
 
 
+def _experiment_out(exp: Any) -> dict[str, Any]:
+    return {
+        "id": exp.id,
+        "scenario": exp.scenario,
+        "seed": exp.seed,
+        "trials": exp.trials,
+        "progress": exp.progress,
+        "status": exp.status,
+        "error": exp.error,
+        "results": [
+            {
+                "metric": r.metric,
+                "unit": r.unit,
+                "unmanaged": r.unmanaged,
+                "cake": r.cake,
+                "eb": r.eb,
+                "ci": r.ci,
+            }
+            for r in exp.results
+        ],
+        "emulated": bool(exp.emulated),
+    }
+
+
 def _settings_out(config: AgentConfig, store: Store) -> dict[str, Any]:
     stored: dict[str, Any] = {}
     for key in (
@@ -459,7 +511,7 @@ def _settings_out(config: AgentConfig, store: Store) -> dict[str, Any]:
     flags = {
         "conflicts": True,
         "health": True,
-        "demand": False,
+        "demand": True,
         "links": False,
         "federated": bool(stored.get("ui:federated", False)),
         "ask": False,
@@ -617,7 +669,7 @@ class _LogRing(logging.Handler):
         try:
             self.records.append(
                 {
-                    "id": f"log-{int(record.created * 1000)}-{record.thread}",
+                    "id": f"log-{uuid.uuid4().hex}",
                     "ts": record.created,
                     "action": record.levelname.lower(),
                     "detail": record.getMessage(),
@@ -680,6 +732,7 @@ def create_app(
     app.state.federated = federated
     app.state.ask = ask_service
     app.state.dev_control = dev_control
+    app.state.session_sockets = {}
     app.state._started = time.time()
 
     @app.middleware("http")
@@ -750,7 +803,7 @@ def create_app(
                 "health": True,
                 "negotiation": True,
                 "self_healing": True,
-                "demand": False,
+                "demand": True,
                 "multilink": False,
                 "links": False,
                 "federated": False,
@@ -824,12 +877,33 @@ def create_app(
     async def stream(ws: WebSocket):
         await ws.accept()
         core: AgentCore = app.state.core
+        sessions_mgr: Optional[SessionManager] = app.state.sessions
+        identity: Optional[AgentIdentity] = app.state.identity
+        session = None
+        if sessions_mgr is not None:
+            session = sessions_mgr.create(
+                identity.agent_id if identity else "eb-agent",
+                role="viewer",
+                ttl_s=6 * 3600,
+                client=(ws.client.host if ws.client else ""),
+                user_agent=ws.headers.get("user-agent", ""),
+            )
+            app.state.session_sockets[session.session_id] = ws
 
         async def send(payload: dict[str, Any]) -> None:
             await ws.send_text(json.dumps(payload))
 
         last_snapshot_ts = 0.0
         try:
+            if session is not None:
+                await send(
+                    {
+                        "event": "hello",
+                        "sessionId": session.session_id,
+                        "role": session.role,
+                        "note": "Read-only live stream; revoking this session closes it.",
+                    }
+                )
             # Send the current state immediately so a new subscriber never
             # waits a whole loop interval for its first paint.
             snap = core.last_snapshot
@@ -865,6 +939,10 @@ def create_app(
                 )
         except (WebSocketDisconnect, RuntimeError):
             pass
+        finally:
+            if session is not None:
+                sessions_mgr.revoke(session.session_id)
+                app.state.session_sockets.pop(session.session_id, None)
 
     @app.get("/api/v1/metrics")
     async def metrics(range: str = "1h", device: str = "all"):
@@ -1049,6 +1127,7 @@ def create_app(
         body = await request.json()
         config: AgentConfig = app.state.config
         store: Store = app.state.store
+        core: AgentCore = app.state.core
         if "mode" in body:
             config.mode = str(body["mode"])
         if "shaping_factor" in body:
@@ -1059,8 +1138,10 @@ def create_app(
             config.dwell_s = float(body["dwellSeconds"])
         if "forecastThreshold" in body:
             config.forecaster_confidence_threshold = float(body["forecastThreshold"])
+            core.forecast_gate.confidence_threshold = config.forecaster_confidence_threshold
         if "classifierThreshold" in body:
             config.classifier_threshold = float(body["classifierThreshold"])
+            core.classifier.threshold = config.classifier_threshold
         if "intervalSeconds" in body:
             config.slow_interval_s = float(body["intervalSeconds"])
         if "floorMbps" in body:
@@ -1113,30 +1194,64 @@ def create_app(
     @app.get("/api/v1/ml/metrics")
     async def ml_metrics():
         store: Store = app.state.store
-        models = store.execute(
-            "SELECT model_id, kind, version, macro_f1, active, created_at FROM models "
-            "ORDER BY version DESC"
-        ).fetchall()
+        core: AgentCore = app.state.core
+        summary = model_registry.active_summary(store)
+        metrics = summary.get("metrics") or {}
+        active = summary.get("model")
+        models = model_registry.list_models(store)
         corrections = store.execute(
             "SELECT c.correction_id, c.flow_id, c.suggested_class, c.confirmed_class, c.state, "
             "c.created_at, f.device_id, d.name AS device_name, f.class AS flow_class "
             "FROM corrections c LEFT JOIN flows f ON f.flow_id=c.flow_id "
             "LEFT JOIN devices d ON d.device_id=f.device_id ORDER BY c.created_at DESC LIMIT 50"
         ).fetchall()
-        active = next((m for m in models if m["active"]), None)
+
+        # Real share of recently observed flows on encrypted ports.  This is a
+        # port measurement, not a guess about payload contents.
+        encrypted_ports = {443, 8443, 853, 993, 995, 5061}
+        recent_flows = store.execute(
+            "SELECT dst_port FROM flows ORDER BY last_seen DESC LIMIT 200"
+        ).fetchall()
+        encrypted: float | None = None
+        if recent_flows:
+            encrypted = sum(
+                1 for row in recent_flows if row["dst_port"] in encrypted_ports
+            ) / len(recent_flows)
+
+        inference = core.inference_state
+        last_at = inference.get("lastAt")
         return {
-            "accuracy": float(active["macro_f1"]) if active and active["macro_f1"] is not None else None,
-            "f1": float(active["macro_f1"]) if active and active["macro_f1"] is not None else None,
-            "baseline": None,
-            "encrypted": None,
-            "matrix": [],
-            "labels": [],
-            "trained": bool(active),
+            "accuracy": metrics.get("accuracy"),
+            "f1": metrics.get("macro_f1"),
+            "baseline": metrics.get("baseline_accuracy"),
+            "baselineF1": metrics.get("baseline_f1"),
+            "encrypted": encrypted,
+            "matrix": metrics.get("matrix") or [],
+            "labels": metrics.get("labels") or [],
+            "trained": bool(summary.get("trained") and core.classifier.is_trained),
+            "modelKind": metrics.get("model_kind") or core.classifier.model_kind or "rule_baseline",
+            "trainingSource": metrics.get("source") or "rule_baseline",
+            "trainingNote": metrics.get("note")
+            or "No local model is trained; the deterministic port/rate rule baseline is active.",
+            "trainedAt": _iso(float(active["created_at"])) if active else None,
+            "nTrain": metrics.get("n_train"),
+            "nTest": metrics.get("n_test"),
+            "inference": {
+                "lastTickMl": inference["last"].get("ml", 0),
+                "lastTickRule": inference["last"].get("rule", 0),
+                "totalMl": inference["totals"].get("ml", 0),
+                "totalRule": inference["totals"].get("rule", 0),
+                "byClass": inference.get("byClass") or {},
+                "lastAt": _iso(float(last_at)) if last_at else None,
+                "threshold": inference.get("threshold"),
+                "shadow": inference.get("shadow") or {},
+            },
             "models": [
                 {
                     "version": f"v{m['version']} · {m['kind']}",
                     "status": "active" if m["active"] else "archived",
-                    "accuracy": float(m["macro_f1"]) if m["macro_f1"] is not None else None,
+                    "accuracy": (m.get("metrics") or {}).get("accuracy")
+                    or m.get("macro_f1"),
                     "date": _iso(float(m["created_at"]))[:10],
                 }
                 for m in models
@@ -1192,31 +1307,51 @@ def create_app(
 
     @app.post("/api/v1/ml/retrain")
     async def ml_retrain():
-        """Report honestly that no live labelled training set exists yet."""
+        """Train a new local classifier version (lab features + approved corrections)."""
+
         store: Store = app.state.store
-        approved = store.execute(
-            "SELECT COUNT(*) AS n FROM corrections WHERE state='approved'"
-        ).fetchone()["n"]
+        core: AgentCore = app.state.core
+        config: AgentConfig = app.state.config
+        extra_rows = model_registry.approved_correction_rows(store)
+        try:
+            result = await asyncio.to_thread(
+                model_registry.train_and_activate,
+                store,
+                core.classifier,
+                data_dir=config.data_dir,
+                extra_rows=extra_rows,
+                reason="api_retrain",
+            )
+        except Exception as error:  # noqa: BLE001 - surface the real failure
+            logger.exception("classifier retrain failed")
+            return {
+                "ok": False,
+                "trained": False,
+                "approvedCorrections": len(extra_rows),
+                "reason": f"Local retrain failed: {error}",
+            }
         return {
-            "ok": False,
-            "trained": False,
-            "approvedCorrections": int(approved),
+            "ok": True,
+            "trained": True,
+            "approvedCorrections": len(extra_rows),
+            "version": result.get("version"),
+            "accuracy": result.get("accuracy"),
+            "macroF1": result.get("macro_f1"),
+            "baselineAccuracy": result.get("baseline_accuracy"),
+            "nTrain": result.get("n_train"),
+            "nTest": result.get("n_test"),
+            "modelKind": result.get("model_kind"),
             "reason": (
-                "No local training job ran. The classifier uses its rule baseline until "
-                "enough approved live corrections exist."
+                "Trained on the deterministic lab generator plus approved local "
+                "corrections; evaluated on a held-out synthetic split."
             ),
         }
 
     @app.post("/api/v1/ml/rollback")
     async def ml_rollback():
         store: Store = app.state.store
-        count = store.execute("SELECT COUNT(*) AS n FROM models").fetchone()["n"]
-        return {
-            "ok": False,
-            "rolledBack": False,
-            "versions": int(count),
-            "reason": "No model versions have been trained on this agent.",
-        }
+        core: AgentCore = app.state.core
+        return model_registry.rollback(store, core.classifier)
 
     @app.get("/api/v1/qoe/formulas")
     async def qoe_formulas():
@@ -1370,13 +1505,58 @@ def create_app(
         ok = negotiation.cancel(conflict_id)
         return {"ok": ok}
 
+    @app.get("/api/v1/demand/forecast")
+    async def demand_forecast():
+        """Per-class demand forecasts fitted on measured flow bytes/s."""
+
+        core: AgentCore = app.state.core
+        store: Store = app.state.store
+        state = core.demand_state
+        learning_row = store.execute(
+            "SELECT value FROM settings WHERE key='ui:demand_learning'"
+        ).fetchone()
+        learning = (
+            bool(_json_dict(learning_row["value"]).get("value", False))
+            if learning_row
+            else False
+        )
+        snap = core.last_snapshot
+        updated = state.get("updatedAt") or None
+        return {
+            "classes": state["forecasts"],
+            "horizonSeconds": state["horizonSeconds"],
+            "capacityMbps": round(float(snap.capacity_mbps or 0.0), 3) if snap else None,
+            "method": "EWMA(alpha=0.3) over measured per-class bytes/s",
+            "learning": learning,
+            "updatedAt": _iso(float(updated)) if updated else None,
+            "synthetic": False,
+        }
+
     @app.get("/api/v1/demand/schedules")
     async def demand_schedules():
         store: Store = app.state.store
+        core: AgentCore = app.state.core
         rows = store.execute(
             "SELECT schedule_id, name, device_id, time, duration, confidence, enabled "
             "FROM demand_schedules ORDER BY created_at DESC"
         ).fetchall()
+        # Schedule confidence is the live model confidence, not a stored
+        # placeholder.  It rises only as real observations accumulate, and is
+        # withheld while demand learning is switched off.
+        learning_row = store.execute(
+            "SELECT value FROM settings WHERE key='ui:demand_learning'"
+        ).fetchone()
+        learning = (
+            bool(_json_dict(learning_row["value"]).get("value", False))
+            if learning_row
+            else False
+        )
+        forecasts = core.demand_state["forecasts"]
+        live_confidence = (
+            max((float(item.get("confidence", 0.0)) for item in forecasts), default=0.0)
+            if learning
+            else 0.0
+        )
         return [
             {
                 "id": r["schedule_id"],
@@ -1384,7 +1564,7 @@ def create_app(
                 "device": r["device_id"],
                 "time": r["time"],
                 "duration": r["duration"],
-                "confidence": r["confidence"],
+                "confidence": round(live_confidence, 3),
                 "enabled": bool(r["enabled"]),
             }
             for r in rows
@@ -1393,8 +1573,23 @@ def create_app(
     @app.post("/api/v1/demand/schedules")
     async def demand_schedule_create(request: Request):
         store: Store = app.state.store
+        core: AgentCore = app.state.core
         body = await request.json()
         schedule_id = f"sched-{uuid.uuid4().hex[:8]}"
+        learning_row = store.execute(
+            "SELECT value FROM settings WHERE key='ui:demand_learning'"
+        ).fetchone()
+        learning = (
+            bool(_json_dict(learning_row["value"]).get("value", False))
+            if learning_row
+            else False
+        )
+        forecasts = core.demand_state["forecasts"]
+        confidence = (
+            max((float(item.get("confidence", 0.0)) for item in forecasts), default=0.0)
+            if learning
+            else 0.0
+        )
         store.execute(
             "INSERT INTO demand_schedules(schedule_id, name, device_id, time, duration, "
             "confidence, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1404,7 +1599,7 @@ def create_app(
                 body.get("device", ""),
                 body.get("time", "09:00"),
                 body.get("duration", "60 min"),
-                body.get("confidence", 0.8),
+                confidence,
                 True,
                 time.time(),
             ),
@@ -1416,7 +1611,7 @@ def create_app(
             "device": body.get("device", ""),
             "time": body.get("time", "09:00"),
             "duration": body.get("duration", "60 min"),
-            "confidence": body.get("confidence", 0.8),
+            "confidence": round(confidence, 3),
             "enabled": True,
         }
 
@@ -1440,14 +1635,20 @@ def create_app(
             "id": scenario_id,
             "active": True,
             "started_at": time.time(),
-            "emulated": False,
+            # Scenario profiles are synthetic lab recordings; keep that label
+            # attached so no UI can present them as live measurements.
+            "emulated": True,
         }
+        store.execute(
+            "UPDATE settings SET value = json_set(value, '$.active', 0) "
+            "WHERE key LIKE 'scenario:%' AND json_extract(value, '$.active') = 1"
+        )
         store.execute(
             "INSERT OR REPLACE INTO settings(key, value, updated_at) VALUES (?, ?, ?)",
             (f"scenario:{scenario_id}", json.dumps(scenario), time.time()),
         )
         store.commit()
-        return {"scenario_id": scenario_id, "active": True, "emulated": False}
+        return {"scenario_id": scenario_id, "active": True, "emulated": True}
 
     @app.post("/api/v1/scenarios/stop")
     async def scenarios_stop():
@@ -1457,10 +1658,10 @@ def create_app(
             "WHERE key LIKE 'scenario:%' AND json_extract(value, '$.active') = 1"
         )
         store.commit()
-        return {"verdict": "scenarios_stopped", "emulated": False}
+        return {"verdict": "scenarios_stopped", "emulated": True}
 
     @app.post("/api/v1/experiments")
-    async def experiments_start(request: Request):
+    async def experiments_start(request: Request, background: BackgroundTasks):
         experiments: ExperimentStore = app.state.experiments
         body = await request.json()
         exp = experiments.create(
@@ -1468,43 +1669,24 @@ def create_app(
             seed=int(body.get("seed", 4242)),
             trials=int(body.get("trials", 20)),
         )
-        run_experiment(experiments, exp)
-        return {
-            "id": exp.id,
-            "scenario": exp.scenario,
-            "seed": exp.seed,
-            "trials": exp.trials,
-            "progress": exp.progress,
-            "status": exp.status,
-            "emulated": False,
-        }
+        exp.status = "running"
+        exp.progress = 1
+        experiments.update(exp)
+        background.add_task(run_experiment, experiments, exp)
+        return _experiment_out(exp)
 
     @app.get("/api/v1/experiments")
     async def experiments_list():
         experiments: ExperimentStore = app.state.experiments
-        return [
-            {
-                "id": e.id,
-                "scenario": e.scenario,
-                "seed": e.seed,
-                "trials": e.trials,
-                "progress": e.progress,
-                "status": e.status,
-                "results": [
-                    {
-                        "metric": r.metric,
-                        "unit": r.unit,
-                        "unmanaged": r.unmanaged,
-                        "cake": r.cake,
-                        "eb": r.eb,
-                        "ci": r.ci,
-                    }
-                    for r in e.results
-                ],
-                "emulated": False,
-            }
-            for e in experiments.list()
-        ]
+        return [_experiment_out(e) for e in experiments.list()]
+
+    @app.get("/api/v1/experiments/{exp_id}")
+    async def experiments_get(exp_id: str):
+        experiments: ExperimentStore = app.state.experiments
+        exp = experiments.get(exp_id)
+        if not exp:
+            raise HTTPException(status_code=404, detail={"code": "not_found", "message": "experiment not found"})
+        return _experiment_out(exp)
 
     @app.get("/api/v1/experiments/{exp_id}/report")
     async def experiments_report(exp_id: str):
@@ -1512,25 +1694,7 @@ def create_app(
         exp = experiments.get(exp_id)
         if not exp:
             raise HTTPException(status_code=404, detail={"code": "not_found", "message": "experiment not found"})
-        return {
-            "id": exp.id,
-            "scenario": exp.scenario,
-            "seed": exp.seed,
-            "trials": exp.trials,
-            "status": exp.status,
-            "results": [
-                {
-                    "metric": r.metric,
-                    "unit": r.unit,
-                    "unmanaged": r.unmanaged,
-                    "cake": r.cake,
-                    "eb": r.eb,
-                    "ci": r.ci,
-                }
-                for r in exp.results
-            ],
-            "emulated": False,
-        }
+        return _experiment_out(exp)
 
     @app.get("/api/v1/federated/status")
     async def federated_status():
@@ -1595,7 +1759,59 @@ def create_app(
 
     @app.post("/api/v1/paths/evaluate")
     async def paths_evaluate():
-        return {"evaluated": [], "emulated": False}
+        """Score the WAN path the agent can actually see (no invented links)."""
+
+        core: AgentCore = app.state.core
+        snap = core.last_snapshot
+        if snap is None:
+            return {
+                "evaluated": [],
+                "emulated": False,
+                "reason": "No snapshot is available yet.",
+            }
+        qoe = snap.qoe if isinstance(snap.qoe, dict) else {}
+        tick = core.last_tick
+        wan = getattr(core, "_wan_iface", None) or "unknown"
+        capacity = float(snap.capacity_mbps or 0.0)
+        rtt = float(qoe.get("rtt_ms", 0.0) or 0.0)
+        loss = float(qoe.get("loss_pct", 0.0) or 0.0)
+        throughput = (
+            float(tick.counters.get("throughput_mbps", 0) or 0.0) if tick else 0.0
+        )
+        # Simple, inspectable eligibility score: capacity headroom and loss.
+        score = max(
+            0.0,
+            min(
+                1.0,
+                (capacity / max(1.0, capacity + throughput))
+                * (1.0 - min(1.0, loss / 10.0))
+                * (1.0 - min(1.0, rtt / 400.0)),
+            ),
+        )
+        return {
+            "evaluated": [
+                {
+                    "id": f"wan-{wan}",
+                    "name": f"WAN · {wan}",
+                    "capacity": round(capacity, 3),
+                    "throughput": round(throughput, 3),
+                    "rtt": round(rtt, 2),
+                    "loss": round(loss, 2),
+                    "score": round(score, 4),
+                    "eligible": capacity > 0 and loss < 5.0,
+                    "reason": (
+                        "Measured uplink is usable."
+                        if capacity > 0 and loss < 5.0
+                        else "Insufficient measured capacity or elevated loss."
+                    ),
+                }
+            ],
+            "recommendation": (
+                "Only one WAN uplink is visible, so no failover path can be "
+                "evaluated on this host."
+            ),
+            "emulated": False,
+        }
 
     @app.get("/api/v1/metrics/internal")
     async def metrics_internal():
@@ -1611,22 +1827,34 @@ def create_app(
     # ------------------------------------------------------------------ security endpoints
 
     @app.get("/api/v1/sessions")
-    async def list_sessions():
+    async def list_sessions(request: Request):
         sessions_mgr: Optional[SessionManager] = app.state.sessions
         identity: Optional[AgentIdentity] = app.state.identity
         agent_id = identity.agent_id if identity else "eb-agent"
         if not sessions_mgr:
             return []
+        client_host = request.client.host if request.client else ""
+        active = [
+            s
+            for s in sessions_mgr.list_sessions(agent_id)
+            if s.revoked_at is None and time.time() <= s.expires_at
+        ]
         return [
             {
                 "id": s.session_id,
+                # Frontend display fields, all derived from the live session.
+                "name": f"{s.role.title()} live console",
+                "location": s.client or "Local client",
+                "lastSeen": f"connected {_iso(s.created_at)}",
+                "current": bool(client_host and s.client == client_host),
                 "agent_id": s.agent_id,
                 "role": s.role,
                 "created_at": s.created_at,
                 "expires_at": s.expires_at,
                 "revoked_at": s.revoked_at,
+                "user_agent": s.user_agent,
             }
-            for s in sessions_mgr.list_sessions(agent_id)
+            for s in active
         ]
 
     @app.delete("/api/v1/sessions/{session_id}")
@@ -1635,18 +1863,81 @@ def create_app(
         if not sessions_mgr:
             raise HTTPException(status_code=404, detail={"code": "not_found", "message": "sessions unavailable"})
         ok = sessions_mgr.revoke(session_id)
-        return {"ok": ok}
+        ws = app.state.session_sockets.pop(session_id, None)
+        if ws is not None:
+            try:
+                await ws.close(code=1008)
+            except RuntimeError:
+                pass
+        store: Store = app.state.store
+        store.execute(
+            "INSERT INTO audit_log(ts, actor, action, target, result, details) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                time.time(),
+                "owner",
+                "session.revoke",
+                session_id[:12],
+                "ok" if ok else "not_found",
+                json.dumps({"liveStreamClosed": ws is not None}),
+            ),
+        )
+        store.commit()
+        return {"ok": ok, "liveStreamClosed": ws is not None}
 
     @app.post("/api/v1/keys/rotate")
     async def rotate_keys():
         store: Store = app.state.store
-        key = f"EB-{uuid.uuid4().hex[:4].upper()}-{uuid.uuid4().hex[:4].upper()}-{uuid.uuid4().hex[:4].upper()}"
+        pairing: Optional[PairingManager] = app.state.pairing
+        identity: Optional[AgentIdentity] = app.state.identity
+        agent_id = identity.agent_id if identity else "eb-agent"
+        agreement = identity.agreement_public_hex() if identity else ""
+        if pairing is not None:
+            secret = pairing.rotate(agent_id, agreement)
+            key = secret.key
+            expires = secret.expires_at
+        else:
+            key = make_pairing_key()
+            expires = time.time() + 900
+        # Persist only a hash of the local pairing secret; the clear key is
+        # returned once to the owner and never stored.
+        store.execute(
+            "INSERT OR REPLACE INTO settings(key, value, updated_at) VALUES (?, ?, ?)",
+            (
+                "pairing:key_hash",
+                json.dumps(
+                    {
+                        "value": hashlib.sha256(key.encode("utf-8")).hexdigest(),
+                        "rotatedAt": time.time(),
+                        "expiresAt": expires,
+                    }
+                ),
+                time.time(),
+            ),
+        )
         store.execute(
             "INSERT INTO audit_log(ts, actor, action, target, result, details) VALUES (?, ?, ?, ?, ?, ?)",
-            (time.time(), "owner", "pairing.rotate", "pairing-key", "ok", "{}"),
+            (
+                time.time(),
+                "owner",
+                "pairing.rotate",
+                "pairing-key",
+                "ok",
+                json.dumps({"expiresAt": expires, "enforced": False}),
+            ),
         )
         store.commit()
-        return {"ok": True, "verdict": "keys_rotated", "key": key}
+        return {
+            "ok": True,
+            "verdict": "keys_rotated",
+            "key": key,
+            "expiresAt": _iso(expires),
+            "enforced": False,
+            "note": (
+                "A new single-use local pairing secret was generated and the "
+                "previous secret hash was replaced. This build does not require "
+                "pairing for local read-only access."
+            ),
+        }
 
     @app.get("/api/v1/audit")
     async def audit():
@@ -1726,6 +2017,27 @@ def run_server(
 
     @app.on_event("startup")
     async def _startup():
+        # Load the active classifier artifact, or train the first local model
+        # before the loops start so the very first snapshot carries real ML
+        # inference provenance instead of silently using the rule baseline.
+        try:
+            bootstrap = await asyncio.to_thread(
+                model_registry.ensure_classifier,
+                store,
+                core.classifier,
+                data_dir=config.data_dir,
+            )
+            logger.info(
+                "classifier ready",
+                extra={
+                    "loaded": bootstrap.get("loaded"),
+                    "version": (bootstrap.get("model") or {}).get("version"),
+                    "macro_f1": (bootstrap.get("model") or {}).get("macro_f1"),
+                },
+            )
+        except Exception as error:  # noqa: BLE001 - keep the agent serving
+            logger.exception("classifier bootstrap failed; rule baseline active")
+            logger.warning("classifier bootstrap error: %s", error)
         await core.start()
 
     @app.on_event("shutdown")
@@ -1786,7 +2098,9 @@ if __name__ == "__main__":
     federated = get_federated_service()
     ask_service = get_ask_service()
     dev_control = get_dev_control_service()
-    print(f"eb-agentd serving on http://{('0.0.0.0')}:{7443} (mode={config.mode})")
+    sessions = SessionManager(store)
+    pairing = PairingManager(store)
+    print(f"eb-agentd serving on http://{('0.0.0.0')}:7443 (mode={config.mode})")
     run_server(
         config,
         core,
@@ -1795,6 +2109,8 @@ if __name__ == "__main__":
         port=7443,
         decision_log=decision_log,
         intent_service=intent_service,
+        pairing=pairing,
+        sessions=sessions,
         health=health,
         negotiation=negotiation,
         experiments=experiments,
