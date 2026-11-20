@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from eb_agent.store import Store
+from eb_agent.store import SCHEMA_VERSION, Store
 
 
 @pytest.fixture
@@ -18,7 +18,7 @@ def tmp_store():
 
 def test_schema_version(tmp_store: Store) -> None:
     cur = tmp_store.execute("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1")
-    assert cur.fetchone()["version"] == 1
+    assert cur.fetchone()["version"] == SCHEMA_VERSION
 
 
 def test_integrity_check(tmp_store: Store) -> None:

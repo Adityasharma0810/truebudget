@@ -4,11 +4,28 @@
 const { Command } = require("commander");
 const path = require("path");
 const fs = require("fs");
-const { spawnSync } = require("child_process");
+const os = require("os");
+const { spawn, spawnSync } = require("child_process");
 
 const PACKAGE_ROOT = path.resolve(__dirname, "..");
-const PYTHON_BIN = process.env.EB_PYTHON || path.join(PACKAGE_ROOT, "..", ".venv", "bin", "python");
+const PYTHON_BIN =
+  process.env.EB_PYTHON || path.join(PACKAGE_ROOT, "..", ".venv", "bin", "python");
 const AGENT_MODULE = path.join(PACKAGE_ROOT, "..", "agent", "eb_agent");
+
+function dataDir() {
+  if (process.env.EB_DATA_DIR) return process.env.EB_DATA_DIR;
+  if (typeof process.getuid === "function" && process.getuid() === 0)
+    return "/var/lib/eb-agent";
+  return path.join(os.homedir(), ".local", "share", "eb-agent");
+}
+
+function childEnv() {
+  return {
+    ...process.env,
+    EB_DATA_DIR: process.env.EB_DATA_DIR || dataDir(),
+    PYTHONPATH: path.join(PACKAGE_ROOT, "..", "agent"),
+  };
+}
 
 const program = new Command();
 
@@ -26,20 +43,18 @@ function python(args, { input = null } = {}) {
     input,
     cwd: PACKAGE_ROOT,
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, PYTHONPATH: path.join(PACKAGE_ROOT, "..", "agent") },
+    env: childEnv(),
   });
   if (result.error) {
     console.error(`eb-agent: failed to run ${cmd.join(" ")}: ${result.error.message}`);
     process.exit(1);
   }
-  if (result.stderr) {
-    process.stderr.write(result.stderr);
-  }
+  if (result.stderr) process.stderr.write(result.stderr);
   return result.stdout;
 }
 
-function pythonModule(module, args, { input = null } = {}) {
-  return python(["-m", module, ...args], { input });
+function pythonModule(module, args, options) {
+  return python(["-m", module, ...args], options);
 }
 
 function ensureAgentDir() {
@@ -51,21 +66,39 @@ function ensureAgentDir() {
   }
 }
 
+function pidPath() {
+  return path.join(dataDir(), "eb-agentd.pid");
+}
+
+function logPath() {
+  return path.join(dataDir(), "logs", "agent.log");
+}
+
+function isRunning(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ----------------------------------------------------------------- init
 
 program
   .command("init")
   .description("Initialize the agent: generate identity, print pairing key + link")
   .option("--docker", "use Docker/WSL2 lab mode (Windows default)")
+  .option("--mode <mode>", "gateway | bridge | lab | monitor")
   .option("--site-url <url>", "pairing site URL", "https://example.com")
   .action((opts) => {
     ensureAgentDir();
-    pythonModule("eb_agent.security", ["gen-identity"], {
-      input: JSON.stringify({ agent_id: undefined }),
-    });
-    // Use the security module to generate a pairing key + link
-    const out = pythonModule("eb_agent.security", ["pair", "--site-url", opts.siteUrl]);
-    console.log(out.trim());
+    const args = [];
+    if (opts.docker) args.push("--docker");
+    if (opts.mode) args.push("--mode", opts.mode);
+    process.stdout.write(
+      pythonModule("eb_agent.cli", ["init", ...args], { input: null })
+    );
   });
 
 // ----------------------------------------------------------------- doctor
@@ -78,8 +111,7 @@ program
     ensureAgentDir();
     const args = ["doctor"];
     if (opts.interface) args.push("--interface", opts.interface);
-    const out = pythonModule("eb_agent.enforcer.doctor", args);
-    console.log(out.trim());
+    process.stdout.write(pythonModule("eb_agent.enforcer.doctor", args));
   });
 
 // ----------------------------------------------------------------- config
@@ -94,8 +126,7 @@ program
     ensureAgentDir();
     const args = ["config", action, key];
     if (action === "set" && value !== undefined) args.push(value);
-    const out = pythonModule("eb_agent.config", args);
-    console.log(out.trim());
+    process.stdout.write(pythonModule("eb_agent.config", args));
   });
 
 // ----------------------------------------------------------------- mode
@@ -111,20 +142,19 @@ program
       process.exit(1);
     }
     ensureAgentDir();
-    const out = pythonModule("eb_agent.config", ["mode", "set", mode]);
-    console.log(out.trim());
+    process.stdout.write(pythonModule("eb_agent.config", ["mode", "set", mode]));
   });
 
 // ----------------------------------------------------------------- pair
 
 program
   .command("pair")
-  .description("Generate a new pairing key")
+  .description("Generate a new single-use pairing key")
   .option("--site-url <url>", "pairing site URL", "https://example.com")
   .action((opts) => {
     ensureAgentDir();
-    const out = pythonModule("eb_agent.security", ["pair", "--site-url", opts.siteUrl]);
-    console.log(out.trim());
+    process.env.EB_SITE_URL = opts.siteUrl;
+    process.stdout.write(pythonModule("eb_agent.cli", ["pair"]));
   });
 
 // ----------------------------------------------------------------- start/stop/restart/status
@@ -133,10 +163,37 @@ program
   .command("start")
   .description("Start the agent daemon (API server + control loops)")
   .option("--port <port>", "API port", "7443")
+  .option("--host <host>", "API host", "0.0.0.0")
   .action((opts) => {
     ensureAgentDir();
-    const out = pythonModule("eb_agent.api", ["serve"]);
-    console.log(out.trim());
+    const pid = pidPath();
+    if (fs.existsSync(pid)) {
+      const existing = Number(fs.readFileSync(pid, "utf8").trim());
+      if (existing && isRunning(existing)) {
+        console.log(`Agent already running (pid ${existing}).`);
+        return;
+      }
+      fs.rmSync(pid, { force: true });
+    }
+    fs.mkdirSync(path.dirname(logPath()), { recursive: true });
+    const out = fs.openSync(logPath(), "a");
+    const child = spawn(
+      PYTHON_BIN,
+      ["-m", "eb_agent.api", "serve"],
+      {
+        cwd: PACKAGE_ROOT,
+        detached: true,
+        stdio: ["ignore", out, out],
+        env: {
+          ...childEnv(),
+          EB_AGENT_PORT: opts.port,
+          EB_AGENT_HOST: opts.host,
+        },
+      }
+    );
+    child.unref();
+    fs.writeFileSync(pid, String(child.pid));
+    console.log(`Started agent (pid ${child.pid}); logs: ${logPath()}`);
   });
 
 program
@@ -144,8 +201,26 @@ program
   .description("Stop the agent daemon")
   .action(() => {
     ensureAgentDir();
-    const out = pythonModule("eb_agent.core", ["stop"]);
-    console.log(out.trim());
+    process.stdout.write(pythonModule("eb_agent.cli", ["stop"]));
+  });
+
+program
+  .command("restart")
+  .description("Restart the agent daemon")
+  .option("--port <port>", "API port", "7443")
+  .option("--host <host>", "API host", "0.0.0.0")
+  .action((opts) => {
+    ensureAgentDir();
+    pythonModule("eb_agent.cli", ["stop"]);
+    const startArgs = ["start"];
+    if (opts.port) startArgs.push("--port", opts.port);
+    if (opts.host) startArgs.push("--host", opts.host);
+    // Re-enter this CLI so the detached spawn logic exists in one place.
+    const result = spawnSync(process.execPath, [__filename, ...startArgs], {
+      stdio: "inherit",
+      env: process.env,
+    });
+    process.exit(result.status ?? 1);
   });
 
 program
@@ -153,19 +228,25 @@ program
   .description("Show agent status")
   .action(() => {
     ensureAgentDir();
-    const out = pythonModule("eb_agent.core", ["status"]);
-    console.log(out.trim());
+    const result = spawnSync(PYTHON_BIN, ["-m", "eb_agent.cli", "status"], {
+      cwd: PACKAGE_ROOT,
+      stdio: "inherit",
+      env: childEnv(),
+    });
+    process.exit(result.status ?? 1);
   });
 
 // ----------------------------------------------------------------- safe-reset
 
 program
   .command("safe-reset")
-  .description("Reset to safe state")
-  .action(() => {
+  .description("Reset to safe state (or --restore adaptive mode)")
+  .option("--restore", "restore adaptive mode")
+  .action((opts) => {
     ensureAgentDir();
-    const out = pythonModule("eb_agent.enforcer.safe_state", ["reset"]);
-    console.log(out.trim());
+    const args = ["safe-reset"];
+    if (opts.restore) args.push("--restore");
+    process.stdout.write(pythonModule("eb_agent.cli", args));
   });
 
 // ----------------------------------------------------------------- lab
@@ -176,8 +257,7 @@ program
   .argument("subcmd", "run | reset | list")
   .action((subcmd) => {
     ensureAgentDir();
-    const out = pythonModule("eb_agent.lab.harness", [subcmd]);
-    console.log(out.trim());
+    process.stdout.write(pythonModule("eb_agent.lab.harness", [subcmd]));
   });
 
 // ----------------------------------------------------------------- logs
@@ -187,22 +267,27 @@ program
   .description("Show agent logs")
   .option("-f, --follow", "follow logs")
   .action((opts) => {
-    ensureAgentDir();
-    const args = ["logs"];
-    if (opts.follow) args.push("-f");
-    const out = pythonModule("eb_agent.core", args);
-    console.log(out.trim());
+    const file = logPath();
+    if (!fs.existsSync(file)) {
+      console.log(`No log file yet at ${file}. Start the agent first.`);
+      return;
+    }
+    if (opts.follow) {
+      const child = spawn("tail", ["-f", file], { stdio: "inherit" });
+      child.on("exit", (code) => process.exit(code ?? 0));
+      return;
+    }
+    process.stdout.write(fs.readFileSync(file, "utf8"));
   });
 
 // ----------------------------------------------------------------- export-diagnostics
 
 program
   .command("export-diagnostics")
-  .description("Export redacted diagnostics bundle")
+  .description("Export a redacted diagnostics bundle")
   .action(() => {
     ensureAgentDir();
-    const out = pythonModule("eb_agent.core", ["export-diagnostics"]);
-    console.log(out.trim());
+    process.stdout.write(pythonModule("eb_agent.cli", ["export-diagnostics"]));
   });
 
 // ----------------------------------------------------------------- sessions
@@ -212,8 +297,7 @@ program
   .description("List active agent sessions")
   .action(() => {
     ensureAgentDir();
-    const out = pythonModule("eb_agent.security", ["sessions"]);
-    console.log(out.trim());
+    process.stdout.write(pythonModule("eb_agent.cli", ["sessions"]));
   });
 
 // ----------------------------------------------------------------- rotate-keys
@@ -223,8 +307,7 @@ program
   .description("Rotate agent agreement keys")
   .action(() => {
     ensureAgentDir();
-    const out = pythonModule("eb_agent.security", ["rotate-keys"]);
-    console.log(out.trim());
+    process.stdout.write(pythonModule("eb_agent.cli", ["rotate-keys"]));
   });
 
 // ----------------------------------------------------------------- update
@@ -234,8 +317,7 @@ program
   .description("Check for agent updates")
   .action(() => {
     ensureAgentDir();
-    const out = pythonModule("eb_agent.api", ["update-check"]);
-    console.log(out.trim());
+    process.stdout.write(pythonModule("eb_agent.cli", ["update"]));
   });
 
 // ----------------------------------------------------------------- uninstall
@@ -244,12 +326,13 @@ program
   .command("uninstall")
   .description("Uninstall the agent (reverts shaping first)")
   .option("--purge", "also remove stored data")
+  .option("--yes", "confirm uninstall without prompting")
   .action((opts) => {
     ensureAgentDir();
     const args = ["uninstall"];
     if (opts.purge) args.push("--purge");
-    const out = pythonModule("eb_agent.core", args);
-    console.log(out.trim());
+    if (opts.yes) args.push("--yes");
+    process.stdout.write(pythonModule("eb_agent.cli", args));
   });
 
 program.parseAsync(process.argv).catch((err) => {

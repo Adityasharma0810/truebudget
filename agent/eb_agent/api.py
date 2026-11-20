@@ -39,7 +39,15 @@ from eb_agent.qoe_server import qoe_band
 from eb_agent.federated import get_federated_service
 from eb_agent.rag import get_ask_service
 from eb_agent.dev_control import get_dev_control_service
-from eb_agent.security import AgentIdentity, PairingManager, SessionManager, generate_identity, make_pairing_key, make_pairing_link
+from eb_agent.security import (
+    AgentIdentity,
+    PairingManager,
+    SessionManager,
+    generate_identity,
+    load_or_create_identity,
+    make_pairing_key,
+    make_pairing_link,
+)
 from eb_agent.store import Store
 
 APP_VERSION = "0.1.0"
@@ -64,6 +72,11 @@ class Capabilities(BaseModel):
     scenarios: list[dict[str, Any]]
     formulas: dict[str, str]
     seed: int
+    mode: str = "lab"
+    emulated: bool = False
+    agent_id: str = ""
+    agreement_public_key: str = ""
+    relay_url: str = ""
 
 
 class Device(BaseModel):
@@ -152,7 +165,8 @@ class RateLimiter:
         return True, None
 
 
-limiter = RateLimiter()
+limiter = RateLimiter(burst=int(os.environ.get("EB_RATE_BURST", "600")))
+MAX_REQUEST_BYTES = int(os.environ.get("EB_MAX_REQUEST_BYTES", str(1024 * 1024)))
 
 
 # ------------------------------------------------------------------ app factory
@@ -752,6 +766,75 @@ def create_app(
         response.headers["X-Request-Id"] = rid
         return response
 
+    @app.middleware("http")
+    async def guard_requests(request: Request, call_next):
+        """Rate limit, bound request size, and replay-safe idempotency keys."""
+
+        declared = request.headers.get("content-length")
+        if declared is not None:
+            try:
+                if int(declared) > MAX_REQUEST_BYTES:
+                    return JSONResponse(
+                        status_code=413,
+                        content={
+                            "code": "request_too_large",
+                            "message": f"Request body exceeds {MAX_REQUEST_BYTES} bytes.",
+                            "details": {"limit": MAX_REQUEST_BYTES},
+                        },
+                    )
+            except ValueError:
+                pass
+
+        client_host = request.client.host if request.client else "unknown"
+        allowed, retry_after = limiter.check(client_host)
+        if not allowed:
+            response = JSONResponse(
+                status_code=429,
+                content={
+                    "code": "rate_limited",
+                    "message": "Too many requests from this client.",
+                    "details": {"retryAfter": round(retry_after or 0, 1)},
+                },
+                headers={"Retry-After": str(int(max(1, retry_after or 1)))},
+            )
+            response.headers["Retry-After"] = str(int(max(1, retry_after or 1)))
+            return response
+
+        idem = (
+            request.headers.get("Idempotency-Key")
+            if request.method in {"POST", "PUT", "PATCH", "DELETE"}
+            else None
+        )
+        cache_key = None
+        if idem:
+            body = await request.body()
+            cache_key = hashlib.sha256(
+                f"{request.method}\n{request.url.path}\n".encode("utf-8")
+                + body
+                + b"\n"
+                + idem.encode("utf-8")
+            ).hexdigest()
+            cached = idempotency_store.get(cache_key)
+            if cached is not None:
+                return JSONResponse(
+                    status_code=cached["status"],
+                    content=cached["body"],
+                    headers={"Idempotency-Replayed": "true"},
+                )
+
+        response = await call_next(request)
+        if cache_key and 200 <= response.status_code < 300 and isinstance(response, JSONResponse):
+            try:
+                payload = json.loads(response.body)
+            except (ValueError, TypeError):
+                payload = None
+            if payload is not None:
+                idempotency_store[cache_key] = {
+                    "status": response.status_code,
+                    "body": payload,
+                }
+        return response
+
     @app.exception_handler(HTTPException)
     async def http_error_handler(request: Request, exc: HTTPException):
         detail = exc.detail
@@ -794,6 +877,8 @@ def create_app(
 
     @app.get("/api/v1/capabilities", response_model=Capabilities)
     async def capabilities():
+        identity: Optional[AgentIdentity] = app.state.identity
+        config: AgentConfig = app.state.config
         return Capabilities(
             flags={
                 # Shown only when the backing implementation is real.
@@ -851,6 +936,11 @@ def create_app(
                 "fairness": "Jain fairness index. 1.0 is equal allocation.",
             },
             seed=0,
+            mode=config.mode,
+            emulated=False,
+            agent_id=identity.agent_id if identity else "",
+            agreement_public_key=identity.agreement_public_hex() if identity else "",
+            relay_url=os.environ.get("RELAY_URL", ""),
         )
 
     @app.get("/api/v1/state/snapshot")
@@ -985,11 +1075,12 @@ def create_app(
         return result
 
     @app.get("/api/v1/flows", response_model=list[Flow])
-    async def flows():
+    async def flows(limit: int = Query(200, ge=1, le=1000), offset: int = Query(0, ge=0)):
         store: Store = app.state.store
         rows = store.execute(
             "SELECT flow_id, device_id, class AS traffic_class, src_ip, dst_ip, "
-            "src_port, dst_port, protocol FROM flows ORDER BY last_seen DESC LIMIT 200"
+            "src_port, dst_port, protocol FROM flows ORDER BY last_seen DESC LIMIT ? OFFSET ?",
+            (limit, offset),
         ).fetchall()
         return [Flow(**dict(r)) for r in rows]
 
@@ -1099,11 +1190,12 @@ def create_app(
         return {"ok": True, "intent_id": intent_id}
 
     @app.get("/api/v1/decisions")
-    async def decisions():
+    async def decisions(limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0)):
         store: Store = app.state.store
         rows = store.execute(
             "SELECT decision_id, ts, trigger, reason, before_qoe, after_qoe, evidence, verdict, "
-            "prev_hash, hash FROM decisions ORDER BY ts DESC LIMIT 50"
+            "prev_hash, hash FROM decisions ORDER BY ts DESC LIMIT ? OFFSET ?",
+            (limit, offset),
         ).fetchall()
         return [_decision_out(row) for row in rows]
 
@@ -1352,6 +1444,78 @@ def create_app(
         store: Store = app.state.store
         core: AgentCore = app.state.core
         return model_registry.rollback(store, core.classifier)
+
+    @app.get("/api/v1/models/updates")
+    async def models_updates(limit: int = Query(50, ge=1, le=200)):
+        store: Store = app.state.store
+        rows = store.execute(
+            "SELECT update_id, model_id, version, url, sha256, state, created_at, details "
+            "FROM model_updates ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return {
+            "active": model_registry.active_summary(store),
+            "updates": [
+                {
+                    "updateId": row["update_id"],
+                    "modelId": row["model_id"],
+                    "version": row["version"],
+                    "url": row["url"],
+                    "sha256": row["sha256"],
+                    "state": row["state"],
+                    "createdAt": _iso(float(row["created_at"])),
+                    "details": json.loads(row["details"]) if row["details"] else {},
+                }
+                for row in rows
+            ],
+            "note": (
+                "Updates are validated and queued locally; this agent does not "
+                "install an artifact until its SHA-256 has been verified."
+            ),
+        }
+
+    @app.post("/api/v1/models/updates")
+    async def submit_model_update(request: Request):
+        body = await request.json()
+        store: Store = app.state.store
+        model_id = str(body.get("modelId") or "").strip()
+        version = str(body.get("version") or "").strip()
+        url = str(body.get("url") or "").strip()
+        sha256 = str(body.get("sha256") or "").strip().lower()
+        if not model_id or not version:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "invalid_update", "message": "modelId and version are required."},
+            )
+        if not url.startswith("https://"):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "invalid_update", "message": "Model updates must use https:// URLs."},
+            )
+        if len(sha256) != 64 or any(c not in "0123456789abcdef" for c in sha256):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "invalid_update", "message": "sha256 must be 64 lowercase hex characters."},
+            )
+        update_id = "upd-" + uuid.uuid4().hex[:16]
+        now = time.time()
+        store.execute(
+            "INSERT INTO model_updates(update_id, model_id, version, url, sha256, state, created_at, details) "
+            "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+            (update_id, model_id, version, url, sha256, now, json.dumps({"source": "api"})),
+        )
+        store.execute(
+            "INSERT INTO audit_log(ts, actor, action, target, result, details) VALUES (?, ?, ?, ?, ?, ?)",
+            (now, "owner", "model.update.submit", model_id, "pending", json.dumps({"version": version, "sha256": sha256})),
+        )
+        store.commit()
+        return {
+            "ok": True,
+            "updateId": update_id,
+            "state": "pending",
+            "installed": False,
+            "note": "Queued for local SHA-256 verification before activation.",
+        }
 
     @app.get("/api/v1/qoe/formulas")
     async def qoe_formulas():
@@ -1814,7 +1978,16 @@ def create_app(
         }
 
     @app.get("/api/v1/metrics/internal")
-    async def metrics_internal():
+    async def metrics_internal(request: Request):
+        host = request.client.host if request.client else ""
+        if host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "local_only",
+                    "message": "Internal metrics are only available from loopback.",
+                },
+            )
         config: AgentConfig = app.state.config
         cpu, mem = _process_metrics()
         return {
@@ -1825,6 +1998,105 @@ def create_app(
         }
 
     # ------------------------------------------------------------------ security endpoints
+
+    @app.post("/api/v1/pair")
+    async def pair(request: Request):
+        """Consume a single-use short pairing key and create a session."""
+
+        body = await request.json()
+        key = str(body.get("key") or "").strip().upper()
+        role = "viewer" if str(body.get("role", "owner")).lower() == "viewer" else "owner"
+        pairing: Optional[PairingManager] = app.state.pairing
+        sessions_mgr: Optional[SessionManager] = app.state.sessions
+        identity: Optional[AgentIdentity] = app.state.identity
+        store: Store = app.state.store
+        if pairing is None or sessions_mgr is None:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "pairing_unavailable", "message": "Pairing is not enabled on this agent."},
+            )
+        if pairing.is_locked_out(key):
+            store.execute(
+                "INSERT INTO audit_log(ts, actor, action, target, result, details) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (time.time(), "client", "pairing.locked", "pairing-key", "denied", "{}"),
+            )
+            store.commit()
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "code": "pairing_locked",
+                    "message": "Too many invalid pairing attempts; wait before trying again.",
+                    "details": {"windowSeconds": 300},
+                },
+            )
+        secret = pairing.consume(key)
+        if secret is None:
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "code": "invalid_pairing_key",
+                    "message": "This pairing key is invalid, expired, or already used.",
+                },
+            )
+        client_host = request.client.host if request.client else ""
+        session, tokens = sessions_mgr.issue(
+            secret.agent_id,
+            role,
+            ttl_s=12 * 3600.0,
+            client=client_host,
+            user_agent=request.headers.get("user-agent", ""),
+        )
+        store.execute(
+            "INSERT INTO audit_log(ts, actor, action, target, result, details) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                time.time(),
+                role,
+                "pairing.consume",
+                session.session_id[:12],
+                "ok",
+                json.dumps({"role": role}),
+            ),
+        )
+        store.commit()
+        return {
+            "ok": True,
+            "agentId": secret.agent_id,
+            "agentPublicKey": identity.agreement_public_hex() if identity else secret.agreement_pub_hex,
+            "sessionId": session.session_id,
+            "role": session.role,
+            "accessToken": tokens.access_token,
+            "refreshToken": tokens.refresh_token,
+            "expiresAt": _iso(session.expires_at),
+        }
+
+    @app.post("/api/v1/session/refresh")
+    async def refresh_session(request: Request):
+        body = await request.json()
+        refresh_token = str(body.get("refreshToken") or "")
+        sessions_mgr: Optional[SessionManager] = app.state.sessions
+        if sessions_mgr is None:
+            raise HTTPException(status_code=503, detail={"code": "sessions_unavailable", "message": "Sessions unavailable."})
+        session = sessions_mgr.authenticate(refresh_token)
+        if session is None:
+            raise HTTPException(
+                status_code=401,
+                detail={"code": "invalid_refresh_token", "message": "The refresh token is invalid or revoked."},
+            )
+        new_session, tokens = sessions_mgr.issue(
+            session.agent_id,
+            session.role,
+            ttl_s=max(60.0, session.expires_at - time.time()),
+            client=session.client,
+            user_agent=session.user_agent,
+        )
+        sessions_mgr.revoke(session.session_id)
+        return {
+            "ok": True,
+            "sessionId": new_session.session_id,
+            "accessToken": tokens.access_token,
+            "refreshToken": tokens.refresh_token,
+        }
 
     @app.get("/api/v1/sessions")
     async def list_sessions(request: Request):
@@ -1940,11 +2212,12 @@ def create_app(
         }
 
     @app.get("/api/v1/audit")
-    async def audit():
+    async def audit(limit: int = Query(100, ge=1, le=1000), offset: int = Query(0, ge=0)):
         store: Store = app.state.store
         rows = store.execute(
             "SELECT id, ts, actor, action, target, result, details FROM audit_log "
-            "ORDER BY ts DESC LIMIT 100"
+            "ORDER BY ts DESC LIMIT ? OFFSET ?",
+            (limit, offset),
         ).fetchall()
         return [_log_entry(row) for row in rows]
 
@@ -2100,17 +2373,21 @@ if __name__ == "__main__":
     dev_control = get_dev_control_service()
     sessions = SessionManager(store)
     pairing = PairingManager(store)
-    print(f"eb-agentd serving on http://{('0.0.0.0')}:7443 (mode={config.mode})")
+    identity = load_or_create_identity(config.data_dir)
+    host = os.environ.get("EB_AGENT_HOST", "0.0.0.0")
+    port = int(os.environ.get("EB_AGENT_PORT", "7443"))
+    print(f"eb-agentd serving on http://{host}:{port} (mode={config.mode}, agent={identity.agent_id})")
     run_server(
         config,
         core,
         store,
-        host="0.0.0.0",
-        port=7443,
+        host=host,
+        port=port,
         decision_log=decision_log,
         intent_service=intent_service,
         pairing=pairing,
         sessions=sessions,
+        identity=identity,
         health=health,
         negotiation=negotiation,
         experiments=experiments,

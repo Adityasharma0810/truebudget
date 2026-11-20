@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 from typing import Iterable
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -304,7 +304,38 @@ CREATE TABLE IF NOT EXISTS model_metrics (
 CREATE INDEX IF NOT EXISTS idx_model_metrics_created ON model_metrics(created_at);
 """
 
-MIGRATIONS: dict[int, str] = {1: SCHEMA_SQL, 2: MIGRATION_2}
+MIGRATION_3 = """
+CREATE TABLE IF NOT EXISTS pairing_secrets (
+  key_hash TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL,
+  agreement_pub TEXT NOT NULL,
+  created_at REAL NOT NULL,
+  expires_at REAL NOT NULL,
+  used INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS pairing_attempts (
+  key_hash TEXT NOT NULL,
+  ts REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pairing_attempts_ts ON pairing_attempts(ts);
+
+CREATE TABLE IF NOT EXISTS model_updates (
+  update_id TEXT PRIMARY KEY,
+  model_id TEXT NOT NULL,
+  version TEXT NOT NULL,
+  url TEXT NOT NULL,
+  sha256 TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending','verified','rejected','installed')),
+  created_at REAL NOT NULL,
+  details TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_model_updates_created ON model_updates(created_at);
+"""
+
+MIGRATIONS: dict[int, str] = {1: SCHEMA_SQL, 2: MIGRATION_2, 3: MIGRATION_3}
 
 
 class Store:
@@ -323,6 +354,11 @@ class Store:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        # The control loops write from a worker thread while the API reads and
+        # occasionally writes on the event loop.  WAL allows concurrent
+        # readers, and the busy timeout serialises the short write bursts
+        # instead of failing with "database is locked".
+        self._conn.execute("PRAGMA busy_timeout=5000")
         # Ensure the version table exists before checking it.
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)"
@@ -409,3 +445,93 @@ class Store:
         self._conn.execute(
             "DELETE FROM qoe_scores WHERE ts < ?", (now - raw_seconds,)
         )
+        self._conn.execute(
+            "DELETE FROM pairing_attempts WHERE ts < ?", (now - 3600.0,)
+        )
+        self._conn.commit()
+
+    # ------------------------------------------------------------------ scheduled maintenance
+
+    def maintenance(
+        self,
+        raw_seconds: int = 86400,
+        agg_days: int = 30,
+        vacuum_interval_s: int = 7 * 86400,
+    ) -> dict[str, object]:
+        """Run retention now and VACUUM at most once per ``vacuum_interval_s``.
+
+        The last vacuum timestamp is persisted in ``settings`` so a restart does
+        not trigger an expensive VACUUM on every boot.
+        """
+
+        self.retention(raw_seconds=raw_seconds, agg_days=agg_days)
+        now = time.time()
+        row = self._conn.execute(
+            "SELECT value FROM settings WHERE key='store:last_vacuum'"
+        ).fetchone()
+        try:
+            last = float(row["value"]) if row else 0.0
+        except (TypeError, ValueError):
+            last = 0.0
+        vacuumed = False
+        if now - last >= vacuum_interval_s:
+            self.vacuum()
+            self._conn.execute(
+                "INSERT OR REPLACE INTO settings(key, value, updated_at) VALUES (?, ?, ?)",
+                ("store:last_vacuum", str(now), now),
+            )
+            self._conn.commit()
+            vacuumed = True
+        return {"retention": True, "vacuumed": vacuumed, "lastVacuum": now if vacuumed else last}
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Small operator CLI: backup, restore, vacuum, integrity."""
+
+    import sys
+
+    from eb_agent.config import AgentConfig
+
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args:
+        print("usage: python -m eb_agent.store backup|restore|vacuum|integrity [path]")
+        return 2
+    command = args[0]
+    config = AgentConfig.load()
+    db_path = config.data_dir / "eb.db"
+    if command == "backup":
+        if len(args) < 2:
+            print("usage: python -m eb_agent.store backup <destination.db>")
+            return 2
+        store = Store(db_path)
+        try:
+            print(str(store.backup(args[1])))
+        finally:
+            store.close()
+        return 0
+    if not db_path.exists():
+        print(f"database not found: {db_path}")
+        return 1
+    store = Store(db_path)
+    try:
+        if command == "restore":
+            if len(args) < 2:
+                print("usage: python -m eb_agent.store restore <source.db>")
+                return 2
+            store.restore(args[1])
+            print(f"restored {args[1]} -> {db_path}")
+        elif command == "vacuum":
+            store.vacuum()
+            print("vacuum complete")
+        elif command == "integrity":
+            print("ok" if store.integrity_check() else "failed")
+        else:
+            print(f"unknown command: {command}")
+            return 2
+    finally:
+        store.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

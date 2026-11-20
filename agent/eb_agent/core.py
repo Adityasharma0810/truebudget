@@ -338,6 +338,7 @@ class AgentCore:
         self._last_queue_pkts = 0
         self._last_queue_bytes = 0
         self._last_policy_signature: tuple | None = None
+        self._maintenance_counter = 0
         self._last_policy_qoe: float | None = None
         self._last_policy_capacity: float | None = None
         # --- forecasting / demand ML state (fed by real measurements) ---
@@ -643,7 +644,38 @@ class AgentCore:
         }
 
     async def _slow_tick(self) -> None:
-        rid = request_id()
+        """Run the synchronous measurement pass off the event loop.
+
+        ``ss``, ``ping`` and SQLite are blocking calls.  Keeping them on the
+        asyncio loop starves the HTTP/WebSocket API during every tick, so the
+        whole pass runs in a worker thread and only publication happens here.
+        """
+
+        snapshot = await asyncio.to_thread(self._compute_slow_tick)
+        if snapshot is None:
+            return
+        self._last_snapshot = snapshot
+        self._last_tick = None
+        if self.on_snapshot:
+            result = self.on_snapshot(snapshot)
+            if asyncio.iscoroutine(result):
+                await result
+        logger.info(
+            "slow tick: %d devices, %d flows, %.2f Mbps capacity, %.1f ms rtt",
+            len(snapshot.devices),
+            len(snapshot.flows),
+            snapshot.capacity_mbps or 0.0,
+            float(snapshot.qoe.get("rtt_ms", 0.0) or 0.0),
+            extra={
+                "request_id": request_id(),
+                "ts": snapshot.ts,
+                "devices": len(snapshot.devices),
+                "flows": len(snapshot.flows),
+                "capacity_mbps": snapshot.capacity_mbps,
+            },
+        )
+
+    def _compute_slow_tick(self) -> Snapshot:
         now = time.time()
         started = time.monotonic()
 
@@ -671,7 +703,7 @@ class AgentCore:
         # 6. Expire overdue intents.
         active_intents = self._refresh_intents(now)
 
-        # 7. Assemble and publish snapshot.
+        # 7. Assemble snapshot; the event-loop wrapper publishes it.
         snapshot = Snapshot(
             ts=now,
             mode=self.config.mode,
@@ -688,32 +720,26 @@ class AgentCore:
             forecast_gate=self.forecast_state["gate"],
             demand_forecast=demand_forecasts,
         )
-        self._last_snapshot = snapshot
-        self._last_tick = None
         self._persist_snapshot(snapshot)
         self._persist_flows(flows)
         self._persist_qoe(qoe)
         self._persist_capacity(estimate, now)
         self._persist_link_metrics(qoe, now)
         self._last_slow_ms = (time.monotonic() - started) * 1000.0
-        if self.on_snapshot:
-            result = self.on_snapshot(snapshot)
-            if asyncio.iscoroutine(result):
-                await result
-        logger.info(
-            "slow tick: %d devices, %d flows, %.2f Mbps capacity, %.1f ms rtt",
-            len(snapshot.devices),
-            len(snapshot.flows),
-            snapshot.capacity_mbps or 0.0,
-            float(qoe.get("rtt_ms", 0.0) or 0.0),
-            extra={
-                "request_id": rid,
-                "ts": snapshot.ts,
-                "devices": len(snapshot.devices),
-                "flows": len(snapshot.flows),
-                "capacity_mbps": snapshot.capacity_mbps,
-            },
-        )
+        self._maintenance_counter += 1
+        # Run retention/downsampling once a minute of slow ticks rather than
+        # on every tick; VACUUM itself is rate-limited inside the store.
+        interval = max(1, int(60.0 / max(1.0, float(self.config.slow_interval_s))))
+        if self._maintenance_counter % interval == 0:
+            try:
+                self.downsample()
+                self.store.maintenance(
+                    raw_seconds=self.config.raw_retention_s,
+                    agg_days=self.config.agg_retention_d,
+                )
+            except Exception:  # noqa: BLE001 - maintenance must not stop control
+                logger.exception("store maintenance failed")
+        return snapshot
 
     # ------------------------------------------------------------------ fast loop
 
@@ -1567,25 +1593,36 @@ class AgentCore:
         return self._last_tick
 
     def downsample(self) -> None:
-        """Downsample raw metrics into aggregates (15m, 24h, 30d buckets)."""
+        """Downsample raw metrics into 15-minute, 10-second and 1-minute buckets.
+
+        The bucket labels are the documented granularities: 15m for long-term
+        trends, 24h for the last day at 10-second resolution, and 30d for the
+        last month at 1-minute resolution.
+        """
+
         now = time.time()
-        self.store.execute(
-            """
-            INSERT OR REPLACE INTO metrics_agg(ts_bucket, granularity, device_id, metric,
-              avg_value, min_value, max_value, p95_value, count, updated_at)
-            SELECT
-              (ts / 900) * 900 AS ts_bucket,
-              '15m' AS granularity,
-              device_id,
-              metric,
-              AVG(value), MIN(value), MAX(value),
-              NULL, COUNT(*), ?
-            FROM metrics_raw
-            WHERE ts > ?
-            GROUP BY ts_bucket, device_id, metric
-            """,
-            (now, now - 86400 * 7),
-        )
+        for granularity, bucket_s, horizon_s in (
+            ("15m", 900, 7 * 86400),
+            ("24h", 10, 86400),
+            ("30d", 60, 30 * 86400),
+        ):
+            self.store.execute(
+                """
+                INSERT OR REPLACE INTO metrics_agg(ts_bucket, granularity, device_id, metric,
+                  avg_value, min_value, max_value, p95_value, count, updated_at)
+                SELECT
+                  (CAST(ts / ? AS INTEGER) * ?) AS ts_bucket,
+                  ? AS granularity,
+                  device_id,
+                  metric,
+                  AVG(value), MIN(value), MAX(value),
+                  NULL, COUNT(*), ?
+                FROM metrics_raw
+                WHERE ts > ?
+                GROUP BY ts_bucket, device_id, metric
+                """,
+                (bucket_s, bucket_s, granularity, now, now - horizon_s),
+            )
         self.store.commit()
 
 

@@ -21,6 +21,19 @@ SYSTEM_CONFIG = Path("/etc/eb-agent/config.toml")
 DEV_CONFIG = Path.home() / ".local/share/eb-agent/config.toml"
 
 
+def _is_root() -> bool:
+    geteuid = getattr(os, "geteuid", None)
+    return bool(geteuid and geteuid() == 0)
+
+
+def _default_data_dir() -> Path:
+    return Path("/var/lib/eb-agent") if _is_root() else DEV_CONFIG.parent
+
+
+def _default_config_path() -> Path:
+    return SYSTEM_CONFIG if _is_root() else DEV_CONFIG
+
+
 @dataclass
 class AgentConfig:
     mode: str = "lab"
@@ -36,13 +49,19 @@ class AgentConfig:
     forecaster_confidence_threshold: float = 0.7
     raw_retention_s: int = 86400
     agg_retention_d: int = 30
-    data_dir: Path = field(default_factory=lambda: Path("/var/lib/eb-agent"))
-    config_path: Path = field(default_factory=lambda: SYSTEM_CONFIG)
+    data_dir: Path = field(default_factory=_default_data_dir)
+    config_path: Path = field(default_factory=_default_config_path)
     socket_path: str = "/run/eb-enforcerd.sock"
     enforcer_token: str | None = None
     dead_man_ttl: float = 30.0
     available_interfaces: list[str] = field(default_factory=list)
     log_level: str = "info"
+    relay_url: str = ""
+    relay_token: str = ""
+    site_url: str = "https://example.com"
+    tls: bool = False
+    https_port: int = 7443
+    mdns: bool = True
 
     def __post_init__(self) -> None:
         self._validate()
@@ -61,6 +80,8 @@ class AgentConfig:
                 config_path = SYSTEM_CONFIG
             elif DEV_CONFIG.exists():
                 config_path = DEV_CONFIG
+            else:
+                config_path = _default_config_path()
         if config_path and config_path.exists():
             cfg = _merge_toml(cfg, config_path)
         cfg = _merge_env(cfg, env_prefix)
@@ -101,8 +122,18 @@ class AgentConfig:
             f'dead_man_ttl = {self.dead_man_ttl}',
             f'interfaces = [{", ".join(repr(i) for i in self.available_interfaces)}]',
             f'log_level = "{self.log_level}"',
+            f'relay_url = "{self.relay_url}"',
+            f'relay_token = "{self.relay_token}"',
+            f'site_url = "{self.site_url}"',
+            f'tls = {str(self.tls).lower()}',
+            f'https_port = {self.https_port}',
+            f'mdns = {str(self.mdns).lower()}',
         ]
         target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        try:
+            target.chmod(0o640)
+        except OSError:
+            pass
 
 
 def _merge_toml(cfg: AgentConfig, path: Path) -> AgentConfig:
@@ -129,6 +160,12 @@ def _merge_env(cfg: AgentConfig, prefix: str) -> AgentConfig:
         f"{prefix}LOG_LEVEL": ("log_level", str),
         f"{prefix}INTERFACES": ("available_interfaces", lambda v: [s.strip() for s in v.split(",") if s.strip()]),
         f"{prefix}DATA_DIR": ("data_dir", lambda v: Path(v)),
+        f"{prefix}RELAY_URL": ("relay_url", str),
+        f"{prefix}RELAY_TOKEN": ("relay_token", str),
+        f"{prefix}SITE_URL": ("site_url", str),
+        f"{prefix}TLS": ("tls", lambda v: v.lower() in {"1", "true", "yes", "on"}),
+        f"{prefix}HTTPS_PORT": ("https_port", int),
+        f"{prefix}MDNS": ("mdns", lambda v: v.lower() in {"1", "true", "yes", "on"}),
     }
     for env_name, (attr, conv) in env_map.items():
         raw = os.environ.get(env_name)
@@ -149,6 +186,21 @@ if __name__ == "__main__":
         if sub == "get":
             print(getattr(cfg, key, "unknown key"))
         elif sub == "set" and value is not None:
+            current = getattr(cfg, key, None)
+            try:
+                if isinstance(current, bool):
+                    value = value.lower() in {"1", "true", "yes", "on"}
+                elif isinstance(current, int):
+                    value = int(value)
+                elif isinstance(current, float):
+                    value = float(value)
+                elif isinstance(current, Path):
+                    value = Path(value).expanduser()
+                elif isinstance(current, list):
+                    value = [item.strip() for item in value.split(",") if item.strip()]
+            except ValueError:
+                print(f"invalid value for {key}: {value}")
+                sys.exit(1)
             setattr(cfg, key, value)
             cfg.save()
             print(f"set {key}={value}")
@@ -158,6 +210,9 @@ if __name__ == "__main__":
         sub = sys.argv[2] if len(sys.argv) > 2 else ""
         mode = sys.argv[3] if len(sys.argv) > 3 else ""
         if sub == "set" and mode:
+            if mode not in {"gateway", "bridge", "lab", "monitor"}:
+                print("mode must be gateway, bridge, lab, or monitor")
+                sys.exit(1)
             cfg = AgentConfig.load()
             cfg.mode = mode
             cfg.save()
