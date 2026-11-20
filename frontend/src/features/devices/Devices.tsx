@@ -10,6 +10,7 @@ import {
   Laptop,
   Wifi,
   Users,
+  ShieldAlert,
 } from "lucide-react";
 import { Link } from "react-router-dom";
 import { useConsole } from "../../app/Layout";
@@ -130,6 +131,24 @@ export default function Devices() {
                   </span>
                   <QoEBadge band={d.band} score={d.qoe} small />
                 </div>
+                {d.qoeWarn && (
+                  <div
+                    className="qoe-warn-line"
+                    title={`Trained QoE early warning (LightGBM, ${d.qoeWarn.horizonS ?? 10}s horizon, source: ${d.qoeWarn.source})`}
+                  >
+                    <ShieldAlert
+                      size={12}
+                      color={d.qoeWarn.alert ? "var(--red, #d64545)" : "var(--muted-fg, #8a8f98)"}
+                    />
+                    <span>
+                      {d.qoeWarn.state === "red"
+                        ? "Degraded now"
+                        : d.qoeWarn.alert
+                          ? `At risk · p(red in ${d.qoeWarn.horizonS ?? 10}s) ${Math.round((d.qoeWarn.pRed ?? 0) * 100)}%`
+                          : `Stable · p(red) ${Math.round((d.qoeWarn.pRed ?? 0) * 100)}%`}
+                    </span>
+                  </div>
+                )}
                 <h2>{d.name}</h2>
                 <p>
                   <Users size={12} />

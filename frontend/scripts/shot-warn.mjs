@@ -1,0 +1,10 @@
+import { chromium } from "@playwright/test";
+const b = await chromium.launch();
+const p = await b.newPage({ viewport: { width: 1440, height: 900 } });
+await p.goto("http://localhost:8443/app/devices", { waitUntil: "networkidle", timeout: 20000 });
+await p.waitForTimeout(6000);
+await p.screenshot({ path: "tests/screenshots/devices-warn.png" });
+await p.goto("http://localhost:8443/app/ml", { waitUntil: "networkidle", timeout: 20000 });
+await p.waitForTimeout(6000);
+await p.screenshot({ path: "tests/screenshots/ml-warner.png" });
+await b.close();

@@ -56,6 +56,7 @@ from eb_agent.qoe_server import (
     stream_qoe,
     weighted_device_qoe,
 )
+from eb_agent.qoe_warner import QoEWarner
 from eb_agent.store import Store
 
 logger = logging.getLogger("eb_agent.core")
@@ -660,12 +661,16 @@ class AgentCore:
         self._last_policy_qoe: float | None = None
         self._last_policy_capacity: float | None = None
         # --- forecasting / demand ML state (fed by real measurements) ---
+        self.qoe_warner = QoEWarner()
+        self.last_qoe_warnings: dict[str, dict[str, Any]] = {}
+        self._last_flows: list[dict] = []
         self.forecaster = HoltWintersForecaster(seasonal_periods=12)
         self.forecast_gate = ForecasterGate(
             confidence_threshold=config.forecaster_confidence_threshold
         )
         self.demand_forecaster = DemandForecaster(alpha=0.3)
         self._capacity_samples: deque[float] = deque(maxlen=288)
+        self._hw_cache: tuple[float, HoltWintersForecaster] | None = None
         self._capacity_forecast: Forecast | None = None
         self._forecast_method = "unavailable"
         self._forecast_confidence = 0.0
@@ -766,6 +771,39 @@ class AgentCore:
             return 1.0
         return sum(abs(a - p) / abs(a) for a, p in pairs) / len(pairs)
 
+    _HW_REFIT_S = 60.0
+    _HW_MAX_SAMPLES = 240
+
+    def _holt_winters_cached(
+        self, samples: Sequence[float], steps: int, now: float
+    ) -> Forecast | None:
+        """Holt-Winters with a refit cadence.
+
+        A statsmodels fit runs a full L-BFGS-B numerical optimisation; doing
+        that twice per slow tick (backtest + publish) burned a whole core
+        continuously and the cost grew with history.  Refit at most once a
+        minute on a capped window and reuse the fitted model in between:
+        ``forecast()`` on an existing fit is O(steps).
+        """
+
+        usable = list(samples)[-self._HW_MAX_SAMPLES :]
+        if len(usable) < 8:
+            return None
+        cache = self._hw_cache
+        if cache is not None:
+            fitted_at, model = cache
+            if now - fitted_at < self._HW_REFIT_S:
+                try:
+                    return model.predict(steps)
+                except Exception:
+                    self._hw_cache = None
+        seasonal = min(12, max(2, len(usable) // 2))
+        model = HoltWintersForecaster(seasonal_periods=seasonal)
+        if not model.fit(usable):
+            return None
+        self._hw_cache = (now, model)
+        return model.predict(steps)
+
     @staticmethod
     def _holt_winters(
         samples: Sequence[float], steps: int
@@ -817,12 +855,13 @@ class AgentCore:
 
         if len(samples) >= 24:
             # Backtest a four-step holdout before trusting Holt-Winters, then
-            # refit on all measurements for the published forecast.
+            # refit on all measurements for the published forecast.  Both fits
+            # share the refit cadence so a slow tick stays cheap.
             if len(samples) >= 28:
-                backtest = self._holt_winters(samples[:-4], 4)
+                backtest = self._holt_winters_cached(samples[:-4], 4, now)
                 if backtest is not None and len(backtest.capacity_mbps) == 4:
                     error = self._mape(samples[-4:], backtest.capacity_mbps)
-            hw = self._holt_winters(samples, steps)
+            hw = self._holt_winters_cached(samples, steps, now)
             if hw is not None:
                 hw.timesteps = [now + (i + 1) * interval for i in range(len(hw.capacity_mbps))]
                 base = 0.45 + 0.35 * min(1.0, len(samples) / 96)
@@ -1002,6 +1041,7 @@ class AgentCore:
 
         # 2. Gather real flow features (from sockets + conntrack) and classify.
         flows = self._gather_and_classify_flows(devices)
+        self._last_flows = flows
 
         # 3. Estimate link capacity (Kalman) from real interface throughput probes.
         estimate = self._estimate_capacity(now)
@@ -1096,6 +1136,7 @@ class AgentCore:
         self._last_tick = tick
         self._last_throughput_mbps = sample_mbps
         self._persist_metrics_raw(now, "throughput_mbps", sample_mbps, "wan")
+        self._update_qoe_warnings(now, estimate.capacity_mbps, sample_mbps)
         if self.on_tick:
             result = self.on_tick(tick)
             if asyncio.iscoroutine(result):
@@ -1109,6 +1150,62 @@ class AgentCore:
                 "step change detected; reactive fallback",
                 extra={"request_id": rid, "statistic": cusum_result.statistic},
             )
+
+    def _update_qoe_warnings(
+        self, now: float, capacity_mbps: float | None, throughput_mbps: float | None
+    ) -> None:
+        """Feed the trained QoE degradation warner once per fast tick.
+
+        The bundle expects one record per device per second.  QoE itself is
+        recomputed on the slow tick, so the per-device quality inputs repeat
+        between slow ticks — they are still real measurements, just sampled at
+        the slower cadence, and the model's lag features see 1 s spacing like
+        in training.
+        """
+
+        warner = getattr(self, "qoe_warner", None)
+        if warner is None or not warner.available:
+            return
+        qoe = self.last_snapshot.qoe if self.last_snapshot else None
+        if not isinstance(qoe, dict):
+            return
+        # fq_codel/cake only exist when the enforcer is actually shaping; in
+        # monitor mode the queue discipline on the WAN interface is whatever
+        # the kernel shipped with, which the model saw as mode_fq=0.
+        fq_mode = bool(
+            getattr(self.config, "mode", "monitor") not in ("monitor",)
+            and self._enforcer_leaf_qdisc_is_fq()
+        )
+        warner._fq_active = fq_mode
+        try:
+            self.last_qoe_warnings = warner.warn(
+                self.last_snapshot.devices if self.last_snapshot else [],
+                self._last_flows,
+                qoe,
+                capacity_mbps,
+                throughput_mbps,
+                now,
+            )
+        except Exception as error:  # noqa: BLE001 - warnings must not break the tick
+            logger.debug("qoe warning tick failed: %s", error)
+
+    def _enforcer_leaf_qdisc_is_fq(self) -> bool:
+        """True when a live fq_codel/cake leaf qdisc is actually applied."""
+
+        try:
+            daemon = getattr(self, "enforcer_daemon", None)
+            state = getattr(daemon, "qdisc_state", None) if daemon else None
+            if not state:
+                return False
+            return any(
+                str(q.get("kind", "")) in {"fq_codel", "cake"}
+                for qs in state.values()
+                if isinstance(qs, list)
+                for q in qs
+                if isinstance(q, dict)
+            )
+        except Exception:  # noqa: BLE001
+            return False
 
     # ------------------------------------------------------------------ real data sources
 

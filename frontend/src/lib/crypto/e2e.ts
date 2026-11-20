@@ -97,12 +97,16 @@ export class SecureChannel {
   }
 
   async seal(payload: unknown, ts = Date.now() / 1000): Promise<Envelope> {
-    this.sendCounter += 1;
+    // Capture the counter once: concurrent seals must each keep their own
+    // value, and the field is mutated by the next caller while this call
+    // awaits crypto.subtle.encrypt.
+    const n = this.sendCounter + 1;
+    this.sendCounter = n;
     const plaintext = new TextEncoder().encode(
-      JSON.stringify({ n: this.sendCounter, ts, plain: payload })
+      JSON.stringify({ n, ts, plain: payload })
     );
-    const nonce = concat(counterBytes(this.sendCounter), randomBytes(8));
-    const aad = concat(AAD_PREFIX, counterBytes(this.sendCounter));
+    const nonce = concat(counterBytes(n), randomBytes(8));
+    const aad = concat(AAD_PREFIX, counterBytes(n));
     const ciphertext = new Uint8Array(
       await crypto.subtle.encrypt(
         { name: "AES-GCM", iv: asBuffer(nonce), additionalData: asBuffer(aad) },
@@ -111,7 +115,7 @@ export class SecureChannel {
       )
     );
     return {
-      n: this.sendCounter,
+      n,
       iv: toBase64(nonce),
       ct: toBase64(ciphertext),
     };

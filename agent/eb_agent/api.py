@@ -311,6 +311,18 @@ def _snapshot_to_frontend(core: AgentCore, config: AgentConfig, store: Store) ->
             "band": dqoe.get("band", "idle") if isinstance(dqoe, dict) else "idle",
             "flows": flows_out,
         }
+        # Trained QoE early warning (LightGBM bundle) when the warner has a
+        # prediction for this device.  Omitted entirely when unavailable so
+        # the UI never shows a placeholder.
+        warning = (getattr(core, "last_qoe_warnings", {}) or {}).get(did)
+        if isinstance(warning, dict) and warning.get("state") not in (None, "inactive"):
+            device_out["qoeWarn"] = {
+                "state": str(warning.get("state", "unknown")),
+                "alert": bool(warning.get("alert", False)),
+                "pRed": warning.get("pRed"),
+                "source": str(warning.get("source", "ml")),
+                "horizonS": warning.get("horizonS"),
+            }
         # Optional fields are omitted when the kernel gives us nothing, so the
         # UI contract's optional strings are never sent as null.
         person_row = store.execute(
@@ -592,7 +604,11 @@ def _metric_points(
     """
     now = time.time()
     since = now - range_s
-    bucket = max(2.0, range_s / 900.0)
+    # ~240 points is ample for a responsive chart and keeps the sealed relay
+    # frame (base64 adds ~4/3, AES another copy) around 40 KB instead of
+    # 150 KB+, which used to queue behind the bridge's send lock and stall
+    # other pages' requests.
+    bucket = max(2.0, range_s / 240.0)
     device_filter = "" if not device or device == "all" else " AND device_id = ?"
 
     def series(metric: str) -> dict[float, float]:
@@ -1059,13 +1075,17 @@ def create_app(
                 tick = core.last_tick
                 snap = core.last_snapshot
                 snapshot_payload = None
-                if snap is not None:
+                if snap is not None and snap.ts != last_snapshot_ts:
+                    # Rebuild the payload only when the slow loop published a
+                    # new snapshot.  Embedding it in every 1 s tick multiplied
+                    # the encoding cost by the fast interval for every
+                    # subscriber and flooded the relay for no benefit: clients
+                    # read counters from ticks and state from snapshots.
+                    last_snapshot_ts = snap.ts
                     snapshot_payload = _snapshot_to_frontend(
                         core, app.state.config, app.state.store
                     )
-                    if snap.ts != last_snapshot_ts:
-                        last_snapshot_ts = snap.ts
-                        await send({"event": "snapshot", "snapshot": snapshot_payload})
+                    await send({"event": "snapshot", "snapshot": snapshot_payload})
                 await send(
                     {
                         "event": "tick",
@@ -1336,6 +1356,25 @@ def create_app(
         )
         store.commit()
         return {"ok": True, "verdict": verdict}
+
+    @app.get("/api/v1/qoe/warnings")
+    async def qoe_warnings():
+        """Live output of the trained QoE degradation warner bundle."""
+
+        core: AgentCore = app.state.core
+        warner = getattr(core, "qoe_warner", None)
+        status = warner.status() if warner else {"available": False}
+        warnings = getattr(core, "last_qoe_warnings", {}) or {}
+        return {
+            "available": bool(status.get("available")),
+            "modelKind": status.get("modelKind"),
+            "horizonS": status.get("horizonS"),
+            "threshold": status.get("threshold"),
+            "ts": time.time(),
+            "devices": [
+                {"deviceId": did, **w} for did, w in warnings.items()
+            ],
+        }
 
     @app.get("/api/v1/ml/metrics")
     async def ml_metrics():
@@ -2371,6 +2410,8 @@ def run_server(
 ) -> None:
     """Create the FastAPI app, start the control loops, and serve uvicorn."""
 
+    from uvicorn import Config, Server
+
     if identity is not None and not config.agent_id:
         config.agent_id = identity.agent_id
     app = create_app(
@@ -2435,16 +2476,12 @@ def run_server(
             await bridge.stop()
         await core.stop()
 
+    server_config = Config(app, host=host, port=port, log_level="info")
+    if ssl_certfile and ssl_keyfile:
+        server_config.ssl_certfile = ssl_certfile
+        server_config.ssl_keyfile = ssl_keyfile
+    server = Server(server_config)
     try:
-        from uvicorn import Config, Server
-
-        server_config = Config(app, host=host, port=port, log_level="info")
-        if ssl_certfile and ssl_keyfile:
-            server_config.ssl_certfile = ssl_certfile
-            server_config.ssl_keyfile = ssl_keyfile
-        server = Server(server_config)
-        import asyncio
-
         asyncio.run(server.serve())
     except KeyboardInterrupt:
         pass
@@ -2452,6 +2489,23 @@ def run_server(
 
 def request_id() -> str:
     return uuid.uuid4().hex[:16]
+
+
+def install_stack_dumper() -> None:
+    """Dump all thread stacks to stderr on SIGUSR1 (live diagnostics).
+
+    Lets an operator capture what the process is actually doing when CPU or
+    memory looks wrong, without attaching a debugger.
+    """
+
+    import faulthandler
+    import signal
+    import sys
+
+    try:
+        faulthandler.register(signal.SIGUSR1, file=sys.stderr)
+    except (AttributeError, ValueError, OSError):  # not available on this platform
+        pass
 
 
 if __name__ == "__main__":
@@ -2464,6 +2518,7 @@ if __name__ == "__main__":
         level=os.environ.get("EB_LOG_LEVEL", "info").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    install_stack_dumper()
 
     cmd = sys.argv[1] if len(sys.argv) > 1 else "serve"
     if cmd == "update-check":

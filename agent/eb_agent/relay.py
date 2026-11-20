@@ -23,11 +23,15 @@ from fastapi.responses import JSONResponse
 
 logger = logging.getLogger("eb_agent.relay")
 
-MAX_MESSAGE_SIZE = 64 * 1024  # 64 KiB
+MAX_MESSAGE_SIZE = 1024 * 1024  # 1 MiB — a 1 h /metrics history is ~150 KB sealed
 HEARTBEAT_INTERVAL = 30.0
 HEARTBEAT_TIMEOUT = 90.0
 MAX_CONNECTIONS = 1000
-RATE_LIMIT_MSGS_PER_MIN = 120
+# The agent streams a snapshot + tick event every fast interval (1 s by
+# default), so one browser legitimately receives ~120-130 messages per
+# minute.  The limit must sit comfortably above the designed event rate
+# while still stopping real floods.
+RATE_LIMIT_MSGS_PER_MIN = 600
 
 
 @dataclass
@@ -50,6 +54,7 @@ class Connection:
         self.last_message = time.time()
         self.msg_count = 0
         self.window_start = time.time()
+        self.e2e_session: Optional[str] = None
 
 
 class Relay:
@@ -132,6 +137,17 @@ class Relay:
             await conn.ws.close(code=status.WS_1000_NORMAL_CLOSURE)
         except Exception:
             pass
+        if conn.kind == "browser" and conn.agent_id and conn.e2e_session:
+            await self._send_to_agent(
+                conn.agent_id,
+                json.dumps(
+                    {
+                        "type": "browser_closed",
+                        "session": conn.e2e_session,
+                        "ts": time.time(),
+                    }
+                ),
+            )
         logger.info(
             "relay disconnect",
             extra={"conn_id": conn_id, "agent_id": conn.agent_id},
@@ -150,8 +166,10 @@ class Relay:
         conn.msg_count += 1
         if conn.msg_count > RATE_LIMIT_MSGS_PER_MIN:
             logger.warning(
-                "relay rate limit",
-                extra={"conn_id": conn_id, "agent_id": conn.agent_id},
+                "relay rate limit kind=%s count=%d agent=%s",
+                conn.kind,
+                conn.msg_count,
+                conn.agent_id,
             )
             return
         if len(message.encode("utf-8")) > MAX_MESSAGE_SIZE:
@@ -162,6 +180,19 @@ class Relay:
             return
 
         conn.last_message = now
+        if conn.kind == "browser":
+            # Remember the browser's E2E session id (e2e_hello is plaintext by
+            # design) so the agent can be told when the socket disappears and
+            # the bridge can drop the channel instead of sealing events for a
+            # dead browser forever.
+            if conn.e2e_session is None and message.startswith('{"type":"e2e_hello"'):
+                try:
+                    parsed = json.loads(message)
+                    session = str(parsed.get("session") or "")
+                    if session:
+                        conn.e2e_session = session
+                except ValueError:
+                    pass
         if conn.kind == "agent":
             # Agent -> broadcast to all browsers in this agent's room
             await self._broadcast_to_agent_room(conn.agent_id, message, sender=conn_id)
@@ -169,6 +200,17 @@ class Relay:
             # Browser -> forward to agent's connection(s)
             if conn.agent_id:
                 await self._forward_to_agent(conn.agent_id, message, sender=conn_id)
+
+    async def _send_to_agent(self, agent_id: str, message: str) -> None:
+        """Send a control message to the agent-kind connections of an agent."""
+
+        for aid in self._agent_conn_ids(agent_id):
+            conn = self._connections.get(aid)
+            if conn:
+                try:
+                    await conn.ws.send_text(message)
+                except Exception:
+                    await self.disconnect(aid)
 
     async def _broadcast_to_agent_room(
         self, agent_id: Optional[str], message: str, sender: str
@@ -192,9 +234,7 @@ class Relay:
     async def _forward_to_agent(
         self, agent_id: str, message: str, sender: str
     ) -> None:
-        async with self._lock:
-            agent_ids = list(self._agent_conns.get(agent_id, set()))
-        for aid in agent_ids:
+        for aid in self._agent_conn_ids(agent_id):
             conn = self._connections.get(aid)
             if conn:
                 try:
@@ -241,6 +281,45 @@ class Relay:
             "connected_at": p.connected_at,
         }
 
+    def online_agents(self) -> list[str]:
+        """Agent ids that currently have at least one live agent connection."""
+
+        return sorted(
+            {
+                c.agent_id
+                for c in self._connections.values()
+                if c.kind == "agent" and c.agent_id
+            }
+        )
+
+    def attach_browser_to_agent(self, conn_id: str, agent_id: str) -> bool:
+        """Late-bind an agent-less browser connection to an agent room.
+
+        A fresh browser that has never paired does not know an agent id.  When
+        exactly one agent is online, joining its room directly is the honest
+        zero-config path; the E2E handshake still proves the agent's identity
+        before any payload flows.  The browser connection is never added to
+        ``_agent_conns``: that index must stay agent-only or the agent's
+        replies would be routed back to the browser that sent the request.
+        """
+
+        conn = self._connections.get(conn_id)
+        if conn is None or conn.kind != "browser":
+            return False
+        if conn.agent_id:
+            return False
+        conn.agent_id = agent_id
+        return True
+
+    def _agent_conn_ids(self, agent_id: str) -> list[str]:
+        """Live agent-kind connection ids for an agent id."""
+
+        return [
+            c.conn_id
+            for c in self._connections.values()
+            if c.kind == "agent" and c.agent_id == agent_id
+        ]
+
     async def _heartbeat_loop(self) -> None:
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
@@ -272,6 +351,33 @@ def create_app() -> FastAPI:
             await ws.close(code=status.WS_1008_POLICY_VIOLATION)
             return
         conn_id = await _relay.connect(ws, kind, agent_id)
+        if kind == "browser" and not agent_id:
+            # A browser that has not paired yet does not know an agent id.
+            # With exactly one agent online, join its room and tell the
+            # browser which agent it is talking to; otherwise publish the
+            # online list so the UI can offer a choice.
+            online = _relay.online_agents()
+            if len(online) == 1:
+                _relay.attach_browser_to_agent(conn_id, online[0])
+                await ws.send_text(
+                    json.dumps(
+                        {
+                            "type": "presence",
+                            "agentId": online[0],
+                            "online": True,
+                            "auto": True,
+                            "ts": time.time(),
+                        },
+                        separators=(",", ":"),
+                    )
+                )
+            elif len(online) > 1:
+                await ws.send_text(
+                    json.dumps(
+                        {"type": "agents", "agents": online, "ts": time.time()},
+                        separators=(",", ":"),
+                    )
+                )
         try:
             while True:
                 message = await ws.receive_text()

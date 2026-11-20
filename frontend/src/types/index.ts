@@ -27,6 +27,15 @@ export const DeviceSchema = z.object({
   qoe: z.number().nullable(),
   band: QoEBandSchema,
   flows: z.array(FlowSchema),
+  qoeWarn: z
+    .object({
+      state: z.string(),
+      alert: z.boolean(),
+      pRed: z.number().nullable(),
+      source: z.string(),
+      horizonS: z.number().nullable(),
+    })
+    .optional(),
 });
 export const ForecastSchema = z.object({
   ts: z.string(),

@@ -1,0 +1,10 @@
+import { chromium } from "@playwright/test";
+const b = await chromium.launch();
+const p = await b.newPage({ viewport: { width: 1440, height: 900 } });
+await p.goto("http://localhost:8443/app", { waitUntil: "networkidle", timeout: 20000 });
+await p.waitForTimeout(4000);
+const t = await p.evaluate(() => document.body.innerText);
+console.log("LEN", t.length);
+console.log(t);
+await p.screenshot({ path: "tests/screenshots/home-check.png" });
+await b.close();

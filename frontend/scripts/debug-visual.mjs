@@ -1,0 +1,11 @@
+import { chromium } from "@playwright/test";
+const b = await chromium.launch();
+const p = await b.newPage({ viewport: { width: 1440, height: 900 } });
+p.on("pageerror", e => console.log("PAGEERROR:", e.message.slice(0, 300)));
+p.on("console", m => { if (m.type() === "error") console.log("CONSOLE-ERR:", m.text().slice(0, 300)); });
+await p.goto("http://localhost:8443/app/devices", { waitUntil: "domcontentloaded", timeout: 20000 });
+await p.waitForTimeout(20000);
+console.log("TEXTLEN", await p.evaluate(() => document.body.innerText.length));
+console.log(await p.evaluate(() => document.body.innerText.slice(0, 600)));
+await p.screenshot({ path: "tests/screenshots/debug-devices.png" });
+await b.close();

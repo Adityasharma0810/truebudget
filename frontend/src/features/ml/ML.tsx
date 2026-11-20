@@ -26,6 +26,21 @@ import {
 import { percent } from "../../lib/format";
 export default function ML() {
   const { data, error, refetch } = useApi<MLData>("/ml/metrics");
+  const warnQuery = useApi<{
+    available: boolean;
+    modelKind?: string;
+    horizonS?: number | null;
+    threshold?: number | null;
+    devices?: Array<{
+      deviceId: string;
+      state: string;
+      alert: boolean;
+      pRed: number | null;
+      qoe?: number | null;
+      source: string;
+      horizonS?: number | null;
+    }>;
+  }>("/qoe/warnings", { refetchInterval: 5000 });
   const task = useTask("Model request completed. See the returned status.");
   const correction = useTask("Correction reviewed.");
   const [cell, setCell] = useState<string | null>(null);
@@ -90,6 +105,35 @@ export default function ML() {
               .map(([cls, count]) => `${cls} ${count}`)
               .join(" · ") || "waiting for flows"}
           </span>
+        </div>
+      </section>
+      <section className="card ml-live">
+        <div className="ml-live-model">
+          <span className="soft-icon">
+            <ShieldCheck size={18} />
+          </span>
+          <div>
+            <strong>
+              {warnQuery.data?.available
+                ? `QoE degradation warner · ${warnQuery.data.modelKind ?? "LightGBM"}`
+                : "QoE degradation warner · not loaded"}
+            </strong>
+            <p>
+              {warnQuery.data?.available
+                ? `Predicts a device entering the poor-QoE state about ${warnQuery.data.horizonS ?? 10}s ahead. Alert threshold p(red) ≥ ${(warnQuery.data.threshold ?? 0).toFixed(3)}, stored in the trained bundle. Fed only measured RTT, jitter, loss, capacity and per-class flow counts.`
+                : "The trained bundle (machine_learning/qoe_only_bundle) is not available to this agent, so early warning falls back to the QoE-level rule."}
+            </p>
+            {warnQuery.data?.available && (warnQuery.data.devices?.length ?? 0) > 0 && (
+              <p className="qoe-warn-live">
+                {warnQuery.data.devices
+                  ?.map(
+                    (d) =>
+                      `${d.deviceId}: ${d.state === "red" ? "degraded now" : d.alert ? `ALERT p=${d.pRed?.toFixed(2)}` : `p(red) ${d.pRed?.toFixed(2) ?? "—"}`}`
+                  )
+                  .join(" · ")}
+              </p>
+            )}
+          </div>
         </div>
       </section>
       <p className="page-note">

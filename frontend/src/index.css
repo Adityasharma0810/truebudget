@@ -7211,3 +7211,22 @@ tbody tr:hover {
     padding: 19px 18px 22px;
   }
 }
+
+/* Trained QoE early-warning line on device cards */
+.qoe-warn-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 7px;
+  font-size: 11px;
+  color: #656d7a;
+}
+.qoe-warn-line span {
+  letter-spacing: 0.1px;
+}
+.qoe-warn-live {
+  margin-top: 4px;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  color: #5c6d87;
+}

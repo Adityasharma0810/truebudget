@@ -3,6 +3,7 @@ import { useEffect } from "react";
 import { z } from "zod";
 import { RelayTransport } from "../transport/RelayTransport";
 import { DirectTransport } from "../transport/DirectTransport";
+import { getActiveAgent, saveAgent, updateAgent, type TransportMode } from "../transport/session";
 import type { Transport } from "../transport/Transport";
 import {
   SnapshotSchema,
@@ -15,13 +16,67 @@ import {
 export const queryClient = new QueryClient({
   defaultOptions: { queries: { retry: 1, staleTime: 1500, refetchOnWindowFocus: false } },
 });
-const mode = import.meta.env?.VITE_TRANSPORT ?? "relay";
+function defaultMode(): TransportMode {
+  const configured = import.meta.env?.VITE_TRANSPORT as TransportMode | undefined;
+  if (configured === "direct" || configured === "relay") return configured;
+  // Relay mode needs a paired agent id, so a fresh browser that has never
+  // paired cannot use it.  Until an agent is stored, talk straight to the
+  // local agent API instead of silently showing an empty console.
+  return getActiveAgent()?.mode ?? "direct";
+}
+
+export interface PairingLink {
+  key: string;
+  agentId: string;
+  publicKey?: string;
+}
+
+/**
+ * Parse the pairing link printed by `eb-agent pair` when it is opened in this
+ * browser: `…?key=EB-…&agent=eb-…#pk=<hex>`.  The key is single-use and is
+ * never persisted; the agent id and pinned public key are.
+ */
+export function parsePairingLink(): PairingLink | null {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const rawKey = params.get("key") || "";
+    const agentId = params.get("agent") || "";
+    if (!rawKey || !agentId) return null;
+    const pk = window.location.hash.startsWith("#pk=")
+      ? window.location.hash.slice(4)
+      : "";
+    return { key: rawKey.trim().toUpperCase(), agentId: agentId.trim(), publicKey: pk.trim() || undefined };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A browser that opens a pairing link must remember the agent BEFORE the
+ * transport is constructed (the constructor reads the stored agent).  The
+ * key itself is kept only in memory for the one connect() call.
+ */
+let pendingPairing: PairingLink | null = parsePairingLink();
+if (pendingPairing) {
+  const stored = getActiveAgent();
+  if (!stored || stored.agentId !== pendingPairing.agentId) {
+    saveAgent({
+      agentId: pendingPairing.agentId,
+      name: pendingPairing.agentId,
+      mode: import.meta.env?.VITE_TRANSPORT === "direct" ? "direct" : "relay",
+      httpUrl: import.meta.env?.VITE_AGENT_HTTP_URL || undefined,
+      relayUrl: import.meta.env?.VITE_RELAY_URL || undefined,
+      publicKey: pendingPairing.publicKey,
+    });
+  } else if (pendingPairing.publicKey && !stored.publicKey) {
+    updateAgent(stored.agentId, { publicKey: pendingPairing.publicKey });
+  }
+}
+
 let currentTransport: Transport =
-  mode === "relay"
+  defaultMode() === "relay"
     ? new RelayTransport()
-    : mode === "direct"
-      ? new DirectTransport()
-      : (() => { throw new Error(`Unknown transport: ${mode}`); })();
+    : new DirectTransport();
 export function setTransport(t: Transport) {
   currentTransport = t;
 }

@@ -37,6 +37,7 @@ function defaultAgentHttpUrl(): string {
 }
 const REQUEST_TIMEOUT_MS = 20_000;
 const MAX_BACKOFF_MS = 30_000;
+const RELAY_FALLBACK_MS = 8_000;
 
 export class TransportError extends Error {
   status: number;
@@ -135,6 +136,7 @@ export class RelayTransport implements Transport {
   private reconnectAttempt = 0;
   private started = false;
   private pairingKey: string | null = null;
+  private fallbackTimer: ReturnType<typeof setTimeout> | null = null;
   private accessToken = "";
   private refreshToken = "";
   private e2eSession = "";
@@ -496,6 +498,19 @@ export class RelayTransport implements Transport {
   private _openRelaySocket(): void {
     const url = relaySocketUrl(this.relayUrl || defaultRelayUrl(), this.agentId);
     this.handshakeStatus = "hello";
+    // A fresh browser that never paired may reach a relay where its agent id
+    // is unknown.  A paired browser whose handshake stalls (lost e2e_ready,
+    // relay hiccup) would otherwise hang forever: arm the fallback timer in
+    // both cases.  The timer is armed once, not per attempt, so reconnect
+    // retries cannot postpone the fallback forever.
+    if (!this.fallbackTimer) {
+      this.fallbackTimer = setTimeout(() => {
+        this.fallbackTimer = null;
+        if (this.handshakeStatus !== "ready" && this.mode === "relay") {
+          this._fallbackToDirect();
+        }
+      }, RELAY_FALLBACK_MS);
+    }
     try {
       this.ws = new WebSocket(url);
     } catch (error) {
@@ -534,7 +549,22 @@ export class RelayTransport implements Transport {
 
   private _browserPrivateKey: Uint8Array | null = null;
 
+  private _fallbackToDirect(): void {
+    if (this.mode !== "relay") return;
+    this.mode = "direct";
+    this.handshakeStatus = "idle";
+    this._rejectPending(new Error("Switched to the local agent connection."));
+    this._failReady(new Error("Relay handshake did not complete; using the local agent API."));
+    this._clearReconnect();
+    this._closeSocket();
+    this._openDirectSocket();
+  }
+
   private _closeSocket(): void {
+    if (this.fallbackTimer) {
+      clearTimeout(this.fallbackTimer);
+      this.fallbackTimer = null;
+    }
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
@@ -612,6 +642,15 @@ export class RelayTransport implements Transport {
       if (message.online === false && this.status === "connected") this.status = "offline";
       return;
     }
+    if (kind === "agents") {
+      // The relay publishes the online agents when this browser has no id.
+      const agents = Array.isArray(message.agents) ? (message.agents as string[]) : [];
+      if (!this.agentId && agents.length) {
+        this.agentId = String(agents[0]);
+        this._dispatch("presence", { agentId: this.agentId, online: true, auto: true });
+      }
+      return;
+    }
     if (kind === "pong") {
       return;
     }
@@ -646,6 +685,10 @@ export class RelayTransport implements Transport {
     this.handshakeStatus = "ready";
     this.status = "connected";
     this.lastError = "";
+    if (this.fallbackTimer) {
+      clearTimeout(this.fallbackTimer);
+      this.fallbackTimer = null;
+    }
     this._startHeartbeat();
     this.readyResolve?.();
     this.readyResolve = null;

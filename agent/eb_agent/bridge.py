@@ -26,7 +26,7 @@ from eb_agent.security import AgentIdentity
 logger = logging.getLogger("eb_agent.bridge")
 
 APP_VERSION = "0.1.0"
-MAX_FRAME_BYTES = 128 * 1024
+MAX_FRAME_BYTES = 1024 * 1024
 REQUEST_TIMEOUT_S = 20.0
 MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 SENSITIVE_GETS = (
@@ -92,6 +92,7 @@ class RelayBridge:
         self._channels: dict[str, SecureChannel] = {}
         self._roles: dict[str, str] = {}
         self._tokens: dict[str, str] = {}
+        self._last_seen: dict[str, float] = {}
         self._ws: Any | None = None
         self._send_lock = asyncio.Lock()
         self._run_task: asyncio.Task | None = None
@@ -182,6 +183,7 @@ class RelayBridge:
                 self._channels.clear()
                 self._roles.clear()
                 self._tokens.clear()
+                self._last_seen.clear()
             if self._stopped.is_set():
                 break
             attempt += 1
@@ -230,8 +232,48 @@ class RelayBridge:
             return
         if kind == "presence":
             return
+        if kind == "browser_closed":
+            # The relay tells us when a browser socket in our room closed so
+            # the channel's crypto state and fan-out slot are freed at once.
+            session = str(message.get("session") or "")
+            if session:
+                self.drop_channel(session)
+            return
         # Unknown plaintext types are ignored; only sealed payloads may carry
         # requests or state.
+
+    def drop_channel(self, session: str) -> None:
+        """Forget one browser session (relay told us its socket closed)."""
+
+        self._channels.pop(session, None)
+        self._roles.pop(session, None)
+        self._tokens.pop(session, None)
+        self._last_seen.pop(session, None)
+
+    def prune_channels(self, max_idle_s: float = 900.0) -> int:
+        """Drop E2E channels whose browser has been silent too long.
+
+        Every live channel costs an AES-GCM seal per streamed event per
+        second, so channels for browsers that vanished (crashed tab, lost
+        socket, the relay never telling us) must not accumulate.  The relay
+        sends ``browser_closed`` on clean disconnects; this TTL sweep is the
+        safety net for unclean ones.
+        """
+
+        now = time.time()
+        stale = [
+            session
+            for session, seen in self._last_seen.items()
+            if now - seen > max_idle_s
+        ]
+        for session in stale:
+            self.drop_channel(session)
+        if stale:
+            logger.info(
+                "pruned %d stale E2E channel(s)", len(stale),
+                extra={"agent_id": self.identity.agent_id},
+            )
+        return len(stale)
 
     async def _handle_hello(self, message: dict) -> None:
         session = str(message.get("session") or "")
@@ -249,6 +291,7 @@ class RelayBridge:
             )
             return
         self._channels[session] = channel
+        self._last_seen[session] = time.time()
         agent_pub = self.identity.agreement_public_hex()
         await self._send_json(
             {
@@ -270,6 +313,7 @@ class RelayBridge:
         channel = self._channels.get(session)
         if channel is None or not isinstance(envelope, dict):
             return
+        self._last_seen[session] = time.time()
         try:
             payload = channel.open(envelope)
         except E2EError as error:
@@ -278,6 +322,7 @@ class RelayBridge:
                 error,
                 extra={"agent_id": self.identity.agent_id, "session": session[:12]},
             )
+            self.drop_channel(session)
             return
         if not isinstance(payload, dict) or payload.get("type") != "request":
             return
@@ -308,6 +353,9 @@ class RelayBridge:
         try:
             envelope = channel.seal(payload)
         except E2EError:
+            # A channel whose keys no longer line up (stale browser, replayed
+            # nonce) is dead weight: every future event would fail too.
+            self.drop_channel(session)
             return
         await self._send_json(
             {"type": "e2e", "session": session, "envelope": envelope}
@@ -428,6 +476,7 @@ class RelayBridge:
                     }
                 else:
                     payload = message.get("payload", message)
+                self.prune_channels()
                 for session in list(self._channels):
                     await self._send_sealed(
                         session,

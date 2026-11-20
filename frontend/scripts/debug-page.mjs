@@ -1,0 +1,16 @@
+import { chromium } from "@playwright/test";
+const route = process.argv[2] || "/app/ml";
+const wait = Number(process.argv[3] || 10000);
+const b = await chromium.launch();
+const p = await b.newPage({ viewport: { width: 1440, height: 900 } });
+const reqs = [];
+p.on("websocket", ws => reqs.push(`WS: ${ws.url()}`));
+p.on("response", r => { if (r.url().includes("7443")) reqs.push(`HTTP ${r.status()} ${r.url()}`); });
+p.on("pageerror", e => reqs.push(`PAGEERROR ${e.message.slice(0,200)}`));
+await p.goto(`http://localhost:8443${route}`, { waitUntil: "networkidle", timeout: 20000 });
+await p.waitForTimeout(wait);
+const t = await p.evaluate(() => document.body.innerText);
+console.log(reqs.join("\n"));
+console.log("TEXTLEN", t.length);
+console.log(t.slice(0, 2500));
+await b.close();
