@@ -59,8 +59,8 @@ def cake_egress_op(op_id: str, plan: EgressPlan) -> EnforceOp:
     params: dict[str, str] = {
         "diffserv4": "",
         "nat": "",
+        # CAKE accepts only one host-isolation mode; egress uses source hosts.
         "dual-srchost": "",
-        "dual-dsthost": "",
     }
     if plan.ack_filter:
         params["ack-filter"] = ""

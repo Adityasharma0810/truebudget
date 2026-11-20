@@ -86,6 +86,37 @@ def default_safe_state(interfaces: Sequence[str]) -> SafeState:
     return SafeState(qdiscs=specs)
 
 
+def _spec_from_kernel(interface: str, entry: dict) -> QdiscSpec | None:
+    kind = str(entry.get("kind") or "")
+    if kind not in {"cake", "htb", "tbf", "fq_codel", "netem", "clsact", "ingress"}:
+        return None
+    options = entry.get("options") or {}
+    bandwidth = None
+    raw = options.get("bandwidth")
+    if isinstance(raw, (int, float)):
+        bandwidth = round(float(raw) * 8.0 / 1_000_000.0, 4)
+    params: dict[str, str] = {}
+    for flag in ("diffserv4", "diffserv3", "besteffort", "nat", "wash", "ingress"):
+        if options.get(flag) is True:
+            params[flag] = ""
+    if options.get("diffserv") == "diffserv4":
+        params["diffserv4"] = ""
+    if options.get("diffserv") == "diffserv3":
+        params["diffserv3"] = ""
+    if options.get("flowmode") in {"dual-srchost", "dual-dsthost"}:
+        params[str(options["flowmode"])] = ""
+    if options.get("ack-filter") == "enabled":
+        params["ack-filter"] = ""
+    return QdiscSpec(
+        kind=kind,
+        interface=interface,
+        parent=str(entry.get("parent") or "root"),
+        handle=entry.get("handle"),
+        bandwidth_mbit=bandwidth,
+        params=params,
+    )
+
+
 def snapshot(
     runner,
     interfaces: Sequence[str],
@@ -95,24 +126,39 @@ def snapshot(
 
     qdiscs: dict[str, list[QdiscSpec]] = {}
     for iface in interfaces:
-        readback = runner.qdisc_show_json(iface)
+        entries: list[dict] = []
+        if hasattr(runner, "qdiscs"):
+            entries = list(runner.qdiscs(iface))
+        elif hasattr(runner, "qdisc_show_json"):
+            state = runner.qdisc_show_json(iface)
+            entries = [state] if state else []
         specs: list[QdiscSpec] = []
-        if readback:
-            kind = readback.get("kind", "cake")
-            if kind not in {"cake", "htb", "tbf", "fq_codel", "netem"}:
-                kind = "cake"
-            specs.append(
-                QdiscSpec(
-                    kind=kind,
-                    interface=iface,
-                    parent=readback.get("parent", "root"),
-                    handle=readback.get("handle"),
-                    bandwidth_mbit=None,
-                    params={},
-                )
-            )
+        for entry in entries:
+            spec = _spec_from_kernel(iface, entry)
+            if spec is not None:
+                specs.append(spec)
         qdiscs[iface] = specs
     return SafeState(qdiscs=qdiscs, updated_at=time.time())
+
+
+def apply(
+    safe: SafeState,
+    controller,
+    available_interfaces: Sequence[str],
+) -> object:
+    """Restore a SafeState through an enforcement controller."""
+
+    from eb_agent.enforcer.catalog import EnforceOp
+
+    safe = validate(safe, available_interfaces)
+    commands = []
+    for iface, specs in safe.qdiscs.items():
+        op = EnforceOp(op_id=f"safe-state-{iface}", qdisc=list(specs))
+        result = controller.apply(op, available_interfaces)
+        commands.append(result)
+        if not result.ok:
+            return result
+    return commands[-1] if commands else None
 
 
 def save(safe: SafeState, path: Path) -> None:

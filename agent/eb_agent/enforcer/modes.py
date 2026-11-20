@@ -96,3 +96,84 @@ def is_shaping_mode(name: str) -> bool:
 
 def is_read_only(name: str) -> bool:
     return get_mode(name).read_only
+
+
+@dataclass(frozen=True)
+class ModeSetupPlan:
+    """Commands a user must explicitly approve to enable a topology mode.
+
+    The enforcer never changes forwarding/NAT silently: ``eb-agent mode set``
+    prints this plan and asks for confirmation first.
+    """
+
+    mode: str
+    commands: list[list[str]] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    requires_confirmation: bool = True
+
+
+def mode_setup(
+    mode: str,
+    wan_interface: str | None = None,
+    lan_interface: str | None = None,
+) -> ModeSetupPlan:
+    """Build the bounded setup plan for a topology mode."""
+
+    topology = get_mode(mode)
+    if mode == MODE_MONITOR:
+        return ModeSetupPlan(
+            mode=mode,
+            notes=["monitor mode is read-only; no qdisc, forwarding or NAT change"],
+        )
+    if mode == MODE_LAB:
+        return ModeSetupPlan(
+            mode=mode,
+            notes=[
+                "lab mode uses netns/veth/netem inside a namespace; "
+                "it never shapes the host's real WAN",
+            ],
+        )
+    if not wan_interface or not lan_interface:
+        raise ModeError(f"{mode} mode needs both --wan and --lan interfaces")
+    if wan_interface == lan_interface:
+        raise ModeError("WAN and LAN interfaces must differ")
+
+    if mode == MODE_BRIDGE:
+        return ModeSetupPlan(
+            mode=mode,
+            notes=[
+                f"attach {wan_interface} and {lan_interface} to a Linux bridge "
+                "(brctl/ip link is operator-managed)",
+                "shaping targets the bridge interface, not the physical ports",
+            ],
+        )
+
+    commands = [
+        ["sysctl", "-w", "net.ipv4.ip_forward=1"],
+        ["sysctl", "-w", "net.ipv6.conf.all.forwarding=1"],
+        ["nft", "add", "table", "ip", "eb_nat"],
+        ["nft", "add", "chain", "ip", "eb_nat", "postrouting",
+         "{ type nat hook postrouting priority srcnat ; policy accept ; }"],
+        ["nft", "add", "rule", "ip", "eb_nat", "postrouting",
+         "oifname", wan_interface, "masquerade"],
+    ]
+    return ModeSetupPlan(
+        mode=mode,
+        commands=commands,
+        notes=[
+            f"forwarding {lan_interface} -> {wan_interface}",
+            "dnsmasq/hostapd are optional and operator-managed",
+            "review every command before applying; use --dry-run to inspect",
+        ],
+    )
+
+
+def render_mode_setup(plan: ModeSetupPlan) -> str:
+    import shlex
+
+    lines = [f"mode: {plan.mode}"]
+    for command in plan.commands:
+        lines.append(shlex.join(command))
+    for note in plan.notes:
+        lines.append(f"# {note}")
+    return "\n".join(lines)

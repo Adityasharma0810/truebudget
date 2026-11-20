@@ -48,14 +48,17 @@ def htb_fallback_op(op_id: str, plan: HtbFallbackPlan) -> EnforceOp:
             root_rate_mbit=plan.root_rate_mbit,
             classes=list(plan.classes),
             leaf_qdisc=plan.leaf_qdisc,
+            default_classid=plan.classes[-1].classid,
         ),
     )
 
 
 def cake_available(runner) -> bool:
-    """Probe whether the kernel has sch_cake available."""
+    """Probe whether the kernel has sch_cake available (dry run, then clean up)."""
 
     result = runner.run(["qdisc", "add", "dev", "lo", "root", "cake"])
-    # Cleanup attempt regardless of result.
-    runner.run(["qdisc", "del", "dev", "lo", "root"], check=False)
+    try:
+        runner.run(["qdisc", "del", "dev", "lo", "root"])
+    except TypeError:
+        pass
     return result.ok

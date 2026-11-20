@@ -53,10 +53,10 @@ def _run(cmd: Sequence[str]) -> tuple[int, str, str]:
 
 
 def _module_loaded(module: str) -> bool:
-    rc, _, _ = _run(["lsmod"])
+    rc, out, _err = _run(["lsmod"])
     if rc != 0:
         return False
-    return any(line.split()[0] == module for line in _.splitlines() if line)
+    return any(line.split()[0] == module for line in out.splitlines() if line.strip())
 
 
 def _has_cap_net_admin() -> bool:

@@ -186,20 +186,22 @@ experience-budget/
 ### Phase 2 — Core enforcement
 **Goal:** bounded, reversible, verified `tc`/nft changes.
 
-- [ ] `enforcer/catalog.py`: allow-listed operation schemas — interface names must match discovered interfaces, rates within bounds, MACs/IPs validated; operation IDs for idempotency; **dry-run** prints exact commands; bounds re-enforced in the enforcer (never trust the controller).
-- [ ] `eb-enforcerd` (privileged daemon): root-owned Unix socket; signed requests; constant-time token check; apply → **read-back via `tc -j`** → report success/mismatch; auto-revert on mismatch/failure; records prior state.
-- [ ] `eb-agentd` enforcer client: snapshot (`tc -j qdisc/class/filter show`, `nft list ruleset`) → apply → verify → rollback on mismatch; decision-log entries.
-- [ ] Topology modes (`config.mode`): `gateway` (WAN+LAN ifaces, forwarding on, nftables NAT; dnsmasq/hostapd documented, optional), `bridge`, `lab` (netns+veth+netem), `monitor` (read-only).
-- [ ] Egress: CAKE on WAN iface, `bandwidth = estimate × shaping_factor (default 0.95)`, flags `diffserv4, nat, dual-srchost/dual-dsthost`, optional `ack-filter`.
-- [ ] Ingress: IFB + `tc filter ... action mirred` + CAKE `ingress` mode.
-- [ ] Per-class/device policy: nftables `inet` sets keyed by MAC/IP (v4+v6) → DSCP/fwmark per traffic class/device; CAKE tins via DSCP.
-- [ ] Fallback: HTB root + per-class HTB classes + `fq_codel` leaves + `tc filter fw` when `sch_cake` unavailable (startup module check + dry run).
-- [ ] IPv4 + IPv6; interface auto-detection with manual override + `doctor` check.
-- [ ] `safety/safe_state.py`: known-safe config (plain conservative CAKE or no shaping); persist + snapshot before every change.
+- [x] `enforcer/catalog.py`: allow-listed operation schemas — interface names must match discovered interfaces, rates within bounds, MACs/IPs validated; operation IDs for idempotency; **dry-run** prints exact commands; bounds re-enforced in the enforcer (never trust the controller).
+- [x] `eb-enforcerd` (privileged daemon): root-owned Unix socket; signed requests; constant-time token check; apply → **read-back via `tc -j`** → report success/mismatch; auto-revert on mismatch/failure; records prior state.
+- [x] `eb-agentd` enforcer client: snapshot (`tc -j qdisc/class/filter show`, `nft list ruleset`) → apply → verify → rollback on mismatch; decision-log entries.
+- [x] Topology modes (`config.mode`): `gateway` (WAN+LAN ifaces, forwarding on, nftables NAT; dnsmasq/hostapd documented, optional), `bridge`, `lab` (netns+veth+netem), `monitor` (read-only).
+- [x] Egress: CAKE on WAN iface, `bandwidth = estimate × shaping_factor (default 0.95)`, flags `diffserv4, nat, dual-srchost/dual-dsthost`, optional `ack-filter`.
+- [x] Ingress: IFB + `tc filter ... action mirred` + CAKE `ingress` mode.
+- [x] Per-class/device policy: nftables `inet` sets keyed by MAC/IP (v4+v6) → DSCP/fwmark per traffic class/device; CAKE tins via DSCP.
+- [x] Fallback: HTB root + per-class HTB classes + `fq_codel` leaves + `tc filter fw` when `sch_cake` unavailable (startup module check + dry run).
+- [x] IPv4 + IPv6; interface auto-detection with manual override + `doctor` check.
+- [x] `safety/safe_state.py`: known-safe config (plain conservative CAKE or no shaping); persist + snapshot before every change.
 
 **Tests:** `FakeTcRunner`/`FakeNft` unit tests (no root); netns integration (apply/read-back/rollback); bounds-rejection property tests; idempotency (re-apply same op ID).
 **Gate G2:** apply/read-back + safe-state tests pass (CI privileged).
 **Commit:** `feat(phase-2): privileged enforcer, CAKE/HTB fallback, nft marking, safe-state`
+
+**Evidence (2026-11-20):** `pytest -m "not netns"` → 204 passed; `unshare -Urn ... pytest -m netns` → 7 passed (real CAKE/TBF/netem/HTB/fq_codel/IFB/mirred/nft). `agent/tests/test_enforcer_hardening.py` covers empty/wrong-rate read-back rejection, exact dry-run rendering, HMAC signature/replay/stale rejection, idempotent replay and conflict, safe-state persistence before apply, MAC-only v4/v6 nft rules, decision logging. `agent/tests/test_enforcer_netns.py` proves apply → `tc -j`/`nft list` read-back → prior-state rollback on a real kernel.
 
 ### Phase 3 — Storage + API + pairing/auth + relay + CLI + real UI transport
 **Goal:** pair from the website; see live snapshot.

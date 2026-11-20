@@ -129,7 +129,8 @@ async def test_apply_rolls_back_on_readback_mismatch() -> None:
         "qdisc": [{"kind": "cake", "interface": "eth0", "bandwidth_mbit": 50.0}],
     }
     response = await daemon._dispatch(request)
-    assert response["verdict"] in {"applied", "applied_unverified", "failed"}
+    assert response["verdict"] in {"applied", "applied_unverified", "failed", "rolled_back"}
+    assert response["ok"] is False
     # rollback commands should have been issued
     assert any(c[:3] == ["qdisc", "del", "dev"] for c in runner.commands)
 

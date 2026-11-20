@@ -120,6 +120,7 @@ async def test_client_connection_refused() -> None:
 @pytest.mark.asyncio
 async def test_client_revert_through_daemon() -> None:
     runner = FakeTcRunner()
+    runner.state["eth0"] = {"kind": "cake"}
     controller = TcController(runner)
 
     sock_path = os.path.join(tempfile.mkdtemp(), "eb-test4.sock")

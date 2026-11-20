@@ -138,13 +138,16 @@ def test_ifb_setup_ops() -> None:
     ops = ifb_setup_ops("prefix", "ifb0")
     assert len(ops) == 1
     assert ops[0].op_id == "prefix-ifb-up"
-    assert ops[0].qdisc[0].interface == "ifb0"
+    assert ops[0].links[0].interface == "ifb0"
+    assert ops[0].links[0].kind == "ifb"
 
 
 def test_mirred_filter_op() -> None:
     op = mirred_filter_op("op-1", "eth0")
     assert op.op_id == "op-1"
-    assert op.qdisc[0].params["mirred-egress-redirect"] == "ifb0"
+    assert op.qdisc[0].kind == "clsact"
+    assert op.filters[0].target == "ifb0"
+    assert op.filters[0].parent == "ingress"
 
 
 def test_cake_ingress_op() -> None:
