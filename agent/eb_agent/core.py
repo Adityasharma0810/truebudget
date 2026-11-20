@@ -118,8 +118,38 @@ def _local_interfaces() -> list[str]:
 
 
 def _read_neighbors() -> list[dict[str, str]]:
-    """Read the kernel IPv4 ARP table (real LAN neighbours)."""
+    """Read the kernel neighbour table (IPv4 + IPv6) from ``ip -j neigh``.
+
+    ``/proc/net/arp`` only exposes IPv4, so IPv6-only hotspot clients and
+    modern phones would otherwise never appear.  ``ip`` is part of iproute2,
+    which the enforcer already requires; the proc table remains a fallback.
+    """
+
     neighbors: list[dict[str, str]] = []
+    try:
+        result = subprocess.run(
+            ["ip", "-j", "neigh", "show"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            for entry in json.loads(result.stdout):
+                dst = str(entry.get("dst") or "").split("%", 1)[0]
+                mac = str(entry.get("lladdr") or "").lower()
+                state = " ".join(entry.get("state") or [])
+                if not dst or not mac or mac == "00:00:00:00:00:00":
+                    continue
+                if "FAILED" in state or "INCOMPLETE" in state:
+                    continue
+                neighbors.append(
+                    {"ip": dst, "mac": mac, "ifname": str(entry.get("dev") or "")}
+                )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        pass
+    if neighbors:
+        return neighbors
     try:
         with open("/proc/net/arp", "r", encoding="utf-8") as fh:
             next(fh, None)
@@ -133,6 +163,172 @@ def _read_neighbors() -> list[dict[str, str]]:
     except OSError:
         pass
     return neighbors
+
+
+def _read_dhcp_leases() -> list[dict[str, str]]:
+    """Read real DHCP leases written by dnsmasq/NetworkManager/OpenWrt.
+
+    A hotspot client often has a lease before it has any ARP entry, so leases
+    are the most reliable way to show a phone that just joined the hotspot.
+    Only standard dnsmasq-format leases are parsed; nothing is invented.
+    """
+
+    import glob
+
+    paths = [
+        "/var/lib/misc/dnsmasq.leases",
+        "/var/lib/dnsmasq/dnsmasq.leases",
+        "/tmp/dhcp.leases",
+        "/var/lib/NetworkManager/dnsmasq.leases",
+    ]
+    paths.extend(glob.glob("/var/lib/NetworkManager/dnsmasq-*.leases"))
+    paths.extend(glob.glob("/var/lib/nm-dnsmasq/*.leases"))
+    leases: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) < 3:
+                        continue
+                    # dnsmasq: <expiry> <mac> <ip> <hostname> <client-id>
+                    mac = parts[1].lower()
+                    ip = parts[2]
+                    if ":" not in mac or mac == "00:00:00:00:00:00":
+                        continue
+                    hostname = parts[3] if len(parts) > 3 and parts[3] != "*" else ""
+                    if mac in seen:
+                        continue
+                    seen.add(mac)
+                    leases.append({"mac": mac, "ip": ip, "hostname": hostname})
+        except OSError:
+            continue
+    return leases
+
+
+def _read_wifi_stations() -> list[dict[str, str]]:
+    """Return associated Wi-Fi stations from ``iw dev <iface> station dump``.
+
+    This finds hotspot clients even when they have not sent IP traffic yet and
+    therefore have no ARP/neighbour entry.  No ``iw`` or no wireless hardware
+    simply yields an empty list.
+    """
+
+    try:
+        dev_result = subprocess.run(
+            ["iw", "dev"], capture_output=True, text=True, timeout=3, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if dev_result.returncode != 0:
+        return []
+    interfaces: list[str] = []
+    for line in dev_result.stdout.splitlines():
+        match = re.match(r"\s*Interface\s+(\S+)", line)
+        if match:
+            interfaces.append(match.group(1))
+    stations: list[dict[str, str]] = []
+    for ifname in interfaces:
+        try:
+            result = subprocess.run(
+                ["iw", "dev", ifname, "station", "dump"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode != 0:
+            continue
+        current: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            if line.startswith("Station "):
+                if current.get("mac"):
+                    stations.append(current)
+                current = {"mac": line.split()[1].lower(), "ifname": ifname}
+            elif current and "signal:" in line:
+                current["signal"] = line.split(":", 1)[1].strip()
+        if current.get("mac"):
+            stations.append(current)
+    return stations
+
+
+def _read_interface_type(ifname: str) -> str:
+    try:
+        with open(f"/sys/class/net/{ifname}/type", "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def _is_household_interface(ifname: str) -> bool:
+    """Exclude loopback and tunnel/virtual interfaces from the device list.
+
+    The agent still measures tunnel interfaces for capacity, but they are not
+    household devices and would otherwise fill the UI with fake "devices".
+    """
+
+    blocked_prefixes = (
+        "lo",
+        "tun",
+        "tap",
+        "wg",
+        "proton",
+        "pvpn",
+        "Cloudflare",
+        "docker",
+        "veth",
+        "br-",
+        "virbr",
+        "dummy",
+        "ipv6leak",
+        "zt",
+        "tailscale",
+    )
+    if ifname.startswith(blocked_prefixes):
+        return False
+    if _read_interface_type(ifname) in {"772", "65534"}:
+        return False
+    return True
+
+
+def _local_subnets() -> list[tuple[str, int]]:
+    """Return IPv4 subnets configured on this host (for gateway discovery)."""
+
+    subnets: list[tuple[str, int]] = []
+    try:
+        result = subprocess.run(
+            ["ip", "-j", "addr", "show"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        if result.returncode != 0:
+            return subnets
+        for entry in json.loads(result.stdout):
+            for addr in entry.get("addr_info") or []:
+                if addr.get("family") != "inet":
+                    continue
+                local = addr.get("local")
+                prefix = int(addr.get("prefixlen") or 24)
+                if local and not local.startswith("127."):
+                    subnets.append((str(local), prefix))
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        pass
+    return subnets
+
+
+def _ip_in_subnet(ip: str, local: str, prefix: int) -> bool:
+    try:
+        packed_ip = struct.unpack("!I", socket.inet_aton(ip))[0]
+        packed_net = struct.unpack("!I", socket.inet_aton(local))[0]
+    except OSError:
+        return False
+    mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF if prefix else 0
+    return (packed_ip & mask) == (packed_net & mask)
 
 
 def _split_endpoint(value: str) -> tuple[str, int]:
@@ -798,51 +994,166 @@ class AgentCore:
     def _refresh_devices(self) -> list[dict]:
         """Discover real devices on this host/LAN and persist them.
 
-        Sources: local interfaces (this host) and the kernel ARP/neighbour
-        table (other LAN hosts).  The default gateway is the router, not a
-        household endpoint, so it is not reported as a device.  No names are
-        invented: a new device is named after its address until the user
-        renames it.
+        Sources, in order of reliability:
+        * local physical interfaces (this host)
+        * kernel neighbour table via ``ip -j neigh`` (IPv4 + IPv6)
+        * DHCP leases (dnsmasq / NetworkManager / OpenWrt)
+        * associated Wi-Fi stations (hotspot clients without an IP yet)
+
+        The default gateway is the router, not a household endpoint, so it is
+        not reported as a device.  No names are invented: a new device is named
+        after its DHCP hostname or address until the user renames it.
         """
+
         now = time.time()
         host_ips: set[str] = set()
+        host_macs: set[str] = set()
         gateway = self._default_gateway()
+        subnets = _local_subnets()
+
         for ifname in _local_interfaces():
-            ipv4 = _interface_ipv4(ifname)
-            if not ipv4:
+            if not _is_household_interface(ifname):
                 continue
-            host_ips.add(ipv4)
+            ipv4 = _interface_ipv4(ifname)
             ipv6 = _interface_ipv6(ifname)
+            if not ipv4 and not ipv6:
+                continue
+            if ipv4:
+                host_ips.add(ipv4)
             if ipv6:
                 host_ips.add(ipv6)
             mac = _interface_mac(ifname)
+            if mac:
+                host_macs.add(mac.lower())
             device_id = f"host-{ifname}"
-            self.store.execute(
-                "INSERT INTO devices(device_id, name, mac, ipv4, ipv6, assigned_at) "
-                "VALUES (?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(device_id) DO UPDATE SET mac=excluded.mac, ipv4=excluded.ipv4, "
-                "ipv6=excluded.ipv6",
-                (device_id, f"This host · {ifname}", mac, ipv4, ipv6, now),
+            self._upsert_device(
+                device_id,
+                f"This host · {ifname}",
+                mac,
+                ipv4,
+                ipv6,
+                now,
             )
+
+        # Neighbour table: covers phones/laptops that have exchanged packets.
         for neighbor in _read_neighbors():
-            ipv4 = neighbor["ip"]
-            mac = neighbor["mac"]
-            if ipv4 in host_ips or ipv4 == gateway:
+            ip = neighbor["ip"]
+            mac = neighbor["mac"].lower()
+            if ip in host_ips or ip == gateway or mac in host_macs:
                 continue
-            if ipv4.startswith("169.254."):
+            if ip.startswith("169.254.") or ip.startswith("fe80:") or ip.startswith("ff"):
                 continue
             device_id = f"dev-{mac.replace(':', '')}"
-            self.store.execute(
-                "INSERT INTO devices(device_id, name, mac, ipv4, ipv6, assigned_at) "
-                "VALUES (?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(device_id) DO UPDATE SET mac=excluded.mac, ipv4=excluded.ipv4",
-                (device_id, f"Device {ipv4}", mac, ipv4, None, now),
+            if ":" in ip:
+                self._upsert_device(device_id, f"Device {ip}", mac, None, ip, now)
+            else:
+                self._upsert_device(device_id, f"Device {ip}", mac, ip, None, now)
+
+        # DHCP leases: a hotspot client gets a lease before its first packet.
+        for lease in _read_dhcp_leases():
+            ip = lease["ip"]
+            mac = lease["mac"].lower()
+            if ip in host_ips or ip == gateway or mac in host_macs:
+                continue
+            if ip.startswith("169.254."):
+                continue
+            hostname = lease.get("hostname") or ""
+            name = hostname if hostname else f"Device {ip}"
+            device_id = f"dev-{mac.replace(':', '')}"
+            if ":" in ip:
+                self._upsert_device(device_id, name, mac, None, ip, now)
+            else:
+                self._upsert_device(device_id, name, mac, ip, None, now)
+
+        # Associated Wi-Fi stations: hotspot clients may have no IP yet.
+        for station in _read_wifi_stations():
+            mac = station["mac"].lower()
+            if mac in host_macs or mac == "00:00:00:00:00:00":
+                continue
+            device_id = f"dev-{mac.replace(':', '')}"
+            self._upsert_device(
+                device_id,
+                f"Wi-Fi client {mac[-8:]}",
+                mac,
+                None,
+                None,
+                now,
             )
+
         self.store.commit()
         rows = self.store.execute(
-            "SELECT device_id, name, mac, ipv4, ipv6, assigned_at FROM devices ORDER BY assigned_at"
+            "SELECT device_id, name, mac, ipv4, ipv6, assigned_at FROM devices "
+            "ORDER BY assigned_at"
         ).fetchall()
-        return [dict(r) for r in rows]
+        devices = [dict(r) for r in rows]
+        self._attach_unknown_flow_devices(devices, subnets, now)
+        return devices
+
+    def _upsert_device(
+        self,
+        device_id: str,
+        name: str,
+        mac: str | None,
+        ipv4: str | None,
+        ipv6: str | None,
+        now: float,
+    ) -> None:
+        """Insert/update a real device without erasing better-known fields."""
+
+        self.store.execute(
+            "INSERT INTO devices(device_id, name, mac, ipv4, ipv6, assigned_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(device_id) DO UPDATE SET "
+            "  mac=COALESCE(excluded.mac, devices.mac), "
+            "  ipv4=COALESCE(excluded.ipv4, devices.ipv4), "
+            "  ipv6=COALESCE(excluded.ipv6, devices.ipv6), "
+            "  name=CASE "
+            "    WHEN excluded.name LIKE 'Device %' OR excluded.name LIKE 'Wi-Fi client %' "
+            "    THEN devices.name ELSE excluded.name END",
+            (device_id, name, mac, ipv4, ipv6, now),
+        )
+
+    def _attach_unknown_flow_devices(
+        self,
+        devices: list[dict],
+        subnets: list[tuple[str, int]],
+        now: float,
+    ) -> None:
+        """Create devices for real LAN source IPs seen in conntrack.
+
+        On a hotspot/gateway, a client can appear in conntrack before its ARP
+        entry is populated.  Only addresses inside a configured local subnet
+        are accepted, so this never invents internet hosts.
+        """
+
+        if not subnets:
+            return
+        known = {d.get("ipv4") for d in devices} | {d.get("ipv6") for d in devices}
+        try:
+            rows = self.store.execute(
+                "SELECT DISTINCT src_ip FROM flows WHERE last_seen > ?", (now - 120.0,)
+            ).fetchall()
+        except Exception:  # noqa: BLE001
+            return
+        changed = False
+        for row in rows:
+            ip = str(row["src_ip"] or "")
+            if not ip or ip in known or ip.startswith("127.") or ip.startswith("169.254."):
+                continue
+            if not any(_ip_in_subnet(ip, local, prefix) for local, prefix in subnets):
+                continue
+            device_id = f"dev-ip-{ip.replace('.', '-').replace(':', '-')}"
+            self._upsert_device(device_id, f"Device {ip}", None, ip if ":" not in ip else None,
+                                ip if ":" in ip else None, now)
+            known.add(ip)
+            changed = True
+        if changed:
+            self.store.commit()
+            rows = self.store.execute(
+                "SELECT device_id, name, mac, ipv4, ipv6, assigned_at FROM devices "
+                "ORDER BY assigned_at"
+            ).fetchall()
+            devices[:] = [dict(r) for r in rows]
 
     def _read_socket_flows(self) -> tuple[list[dict], int]:
         """Read real per-socket byte counters and RTT from ``ss``.
