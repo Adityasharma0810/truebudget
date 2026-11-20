@@ -43,7 +43,7 @@ from eb_agent.classifier import (
 from eb_agent.config import AgentConfig
 from eb_agent.decision_log import DecisionLog
 from eb_agent.demand import DemandForecaster
-from eb_agent.estimator import CUSUMDetector, KalmanEstimator, step_change_detected
+from eb_agent.estimator import CUSUMDetector, CUSUMResult, KalmanEstimator, step_change_detected
 from eb_agent.forecaster import Forecast, ForecasterGate, HoltWintersForecaster
 from eb_agent.intents import IntentService
 from eb_agent.policy import FlowDemand, PolicyState, max_min_allocate
@@ -165,12 +165,103 @@ def _read_neighbors() -> list[dict[str, str]]:
     return neighbors
 
 
+def _mac_from_client_id(value: str) -> str:
+    """Extract a MAC address from a DHCP client identifier.
+
+    NetworkManager/systemd-networkd write ``CLIENTID=01:aa:bb:...`` for
+    Ethernet clients; the leading ``01`` is the hardware-type prefix.
+    """
+
+    raw = value.strip().strip('"').lower().replace("-", ":")
+    parts = raw.split(":")
+    if len(parts) == 7 and parts[0] == "01":
+        candidate = ":".join(parts[1:])
+    elif len(parts) == 6:
+        candidate = raw
+    else:
+        return ""
+    if candidate == "00:00:00:00:00:00":
+        return ""
+    if not re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", candidate):
+        return ""
+    return candidate
+
+
+def _parse_dhcp_lease_file(path: str) -> list[dict[str, str]]:
+    """Parse one real DHCP lease file (dnsmasq, NM/systemd, or Kea CSV)."""
+
+    leases: list[dict[str, str]] = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return leases
+    if not lines:
+        return leases
+
+    if path.endswith(".csv"):
+        import csv
+
+        reader = csv.DictReader(lines)
+        for row in reader:
+            ip = (row.get("address") or row.get("ip") or "").strip()
+            mac = (row.get("hwaddr") or row.get("mac") or "").strip().lower()
+            if not ip or not mac:
+                continue
+            leases.append(
+                {
+                    "mac": mac,
+                    "ip": ip,
+                    "hostname": (row.get("hostname") or "").strip(),
+                }
+            )
+        return leases
+
+    # NetworkManager/systemd-networkd key=value lease files.
+    if any("=" in line and not line.lstrip().startswith("#") for line in lines):
+        values: dict[str, str] = {}
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, _, value = stripped.partition("=")
+            values[key.strip().upper()] = value.strip()
+        ip = values.get("ADDRESS") or values.get("IPADDRESS") or ""
+        mac = _mac_from_client_id(values.get("CLIENTID", ""))
+        if not mac:
+            mac = values.get("MACADDRESS", "").lower()
+        if ip and mac:
+            leases.append(
+                {
+                    "mac": mac,
+                    "ip": ip,
+                    "hostname": values.get("HOSTNAME", ""),
+                }
+            )
+        return leases
+
+    # dnsmasq: <expiry> <mac> <ip> <hostname> <client-id>
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        mac = parts[1].lower()
+        ip = parts[2]
+        if not re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", mac):
+            continue
+        if mac == "00:00:00:00:00:00":
+            continue
+        hostname = parts[3] if len(parts) > 3 and parts[3] != "*" else ""
+        leases.append({"mac": mac, "ip": ip, "hostname": hostname})
+    return leases
+
+
 def _read_dhcp_leases() -> list[dict[str, str]]:
     """Read real DHCP leases written by dnsmasq/NetworkManager/OpenWrt.
 
     A hotspot client often has a lease before it has any ARP entry, so leases
     are the most reliable way to show a phone that just joined the hotspot.
-    Only standard dnsmasq-format leases are parsed; nothing is invented.
+    Only real lease files are parsed; nothing is invented.
     """
 
     import glob
@@ -180,30 +271,21 @@ def _read_dhcp_leases() -> list[dict[str, str]]:
         "/var/lib/dnsmasq/dnsmasq.leases",
         "/tmp/dhcp.leases",
         "/var/lib/NetworkManager/dnsmasq.leases",
+        "/var/lib/kea/kea-leases4.csv",
     ]
     paths.extend(glob.glob("/var/lib/NetworkManager/dnsmasq-*.leases"))
+    paths.extend(glob.glob("/var/lib/NetworkManager/internal-*.lease"))
     paths.extend(glob.glob("/var/lib/nm-dnsmasq/*.leases"))
+    paths.extend(glob.glob("/run/systemd/netif/leases/*"))
     leases: list[dict[str, str]] = []
     seen: set[str] = set()
     for path in paths:
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    parts = line.split()
-                    if len(parts) < 3:
-                        continue
-                    # dnsmasq: <expiry> <mac> <ip> <hostname> <client-id>
-                    mac = parts[1].lower()
-                    ip = parts[2]
-                    if ":" not in mac or mac == "00:00:00:00:00:00":
-                        continue
-                    hostname = parts[3] if len(parts) > 3 and parts[3] != "*" else ""
-                    if mac in seen:
-                        continue
-                    seen.add(mac)
-                    leases.append({"mac": mac, "ip": ip, "hostname": hostname})
-        except OSError:
-            continue
+        for lease in _parse_dhcp_lease_file(path):
+            mac = lease["mac"]
+            if mac in seen:
+                continue
+            seen.add(mac)
+            leases.append(lease)
     return leases
 
 
@@ -456,6 +538,42 @@ def _discover_wan_interface() -> str | None:
     return None
 
 
+def _link_speed_mbps(ifname: str | None) -> float | None:
+    """Read the negotiated link speed for a physical interface, if exposed."""
+
+    if not ifname:
+        return None
+    try:
+        with open(f"/sys/class/net/{ifname}/speed", "r", encoding="utf-8") as fh:
+            speed = float(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+    if speed <= 0 or speed > 1_000_000:
+        return None
+    return speed
+
+
+def _default_gateway_ipv6() -> str | None:
+    """Return the IPv6 default gateway address, if one is configured."""
+
+    try:
+        result = subprocess.run(
+            ["ip", "-6", "route", "show", "default"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if "via" in parts:
+                    return parts[parts.index("via") + 1].split("%", 1)[0]
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
 @dataclass
 class Snapshot:
     ts: float
@@ -503,9 +621,14 @@ class AgentCore:
         self.config = config
         self.store = store
         self.classifier = classifier or get_classifier()
+        self._wan_iface = _discover_wan_interface()
+        self._link_speed_mbps = _link_speed_mbps(self._wan_iface)
+        initial_capacity = self._link_speed_mbps or 100.0
         self.estimator = estimator or KalmanEstimator(
-            initial_capacity_mbps=config.shaping_factor * 100.0
+            initial_capacity_mbps=initial_capacity
         )
+        self._capacity_source = "link_speed" if self._link_speed_mbps else "prior"
+        self._capacity_updates = 0
         self.cusum = cusum or CUSUMDetector()
         self.intent_service = intent_service
         self.decision_log = decision_log
@@ -521,7 +644,6 @@ class AgentCore:
         self._last_snapshot: Snapshot | None = None
         self._last_tick: Tick | None = None
         self.emulated = emulated
-        self._wan_iface = _discover_wan_interface()
         self._last_rx_bytes: int | None = None
         self._last_tx_bytes: int | None = None
         self._last_probe_ts: float | None = None
@@ -957,15 +1079,14 @@ class AgentCore:
         now = time.time()
         # Probe real interface throughput and feed Kalman + CUSUM.
         sample_mbps = self._probe_throughput()
-        estimate, cusum_result = step_change_detected(
-            self.estimator, sample_mbps, self.cusum, dt=self.config.fast_interval_s
-        )
+        estimate, cusum_result = self._update_capacity(sample_mbps)
         tick = Tick(
             ts=now,
             interval_s=self.config.fast_interval_s,
             counters={
                 "throughput_mbps": sample_mbps,
                 "capacity_mbps": estimate.capacity_mbps,
+                "capacity_source": self._capacity_source,
                 "cusum_triggered": cusum_result.triggered,
                 "cusum_statistic": round(cusum_result.statistic, 3),
                 "wan_interface": self._wan_iface,
@@ -1009,6 +1130,7 @@ class AgentCore:
         host_ips: set[str] = set()
         host_macs: set[str] = set()
         gateway = self._default_gateway()
+        gateway6 = _default_gateway_ipv6()
         subnets = _local_subnets()
 
         for ifname in _local_interfaces():
@@ -1033,40 +1155,73 @@ class AgentCore:
                 ipv4,
                 ipv6,
                 now,
+                kind="Host",
+                source="interface",
             )
 
+        # Read the associated Wi-Fi station list once: a MAC seen here is a
+        # hotspot client even if the neighbour table also knows its address.
+        wifi_stations = _read_wifi_stations()
+        wifi_macs = {station["mac"].lower() for station in wifi_stations}
+
         # Neighbour table: covers phones/laptops that have exchanged packets.
-        for neighbor in _read_neighbors():
+        neighbors = _read_neighbors()
+        gateway_macs = {
+            n["mac"].lower()
+            for n in neighbors
+            if n["ip"] in {gateway, gateway6}
+        }
+        for neighbor in neighbors:
             ip = neighbor["ip"]
             mac = neighbor["mac"].lower()
-            if ip in host_ips or ip == gateway or mac in host_macs:
+            if (
+                ip in host_ips
+                or ip == gateway
+                or ip == gateway6
+                or mac in host_macs
+                or mac in gateway_macs
+            ):
                 continue
             if ip.startswith("169.254.") or ip.startswith("fe80:") or ip.startswith("ff"):
                 continue
             device_id = f"dev-{mac.replace(':', '')}"
+            kind = "Wi-Fi client" if mac in wifi_macs else "LAN device"
             if ":" in ip:
-                self._upsert_device(device_id, f"Device {ip}", mac, None, ip, now)
+                self._upsert_device(
+                    device_id, f"Device {ip}", mac, None, ip, now,
+                    kind=kind, source="neigh",
+                )
             else:
-                self._upsert_device(device_id, f"Device {ip}", mac, ip, None, now)
+                self._upsert_device(
+                    device_id, f"Device {ip}", mac, ip, None, now,
+                    kind=kind, source="neigh",
+                )
 
         # DHCP leases: a hotspot client gets a lease before its first packet.
         for lease in _read_dhcp_leases():
             ip = lease["ip"]
             mac = lease["mac"].lower()
-            if ip in host_ips or ip == gateway or mac in host_macs:
+            if ip in host_ips or ip == gateway or ip == gateway6 or mac in host_macs or mac in gateway_macs:
                 continue
             if ip.startswith("169.254."):
                 continue
             hostname = lease.get("hostname") or ""
             name = hostname if hostname else f"Device {ip}"
             device_id = f"dev-{mac.replace(':', '')}"
+            kind = "Wi-Fi client" if mac in wifi_macs else "DHCP client"
             if ":" in ip:
-                self._upsert_device(device_id, name, mac, None, ip, now)
+                self._upsert_device(
+                    device_id, name, mac, None, ip, now,
+                    kind=kind, source="dhcp",
+                )
             else:
-                self._upsert_device(device_id, name, mac, ip, None, now)
+                self._upsert_device(
+                    device_id, name, mac, ip, None, now,
+                    kind=kind, source="dhcp",
+                )
 
         # Associated Wi-Fi stations: hotspot clients may have no IP yet.
-        for station in _read_wifi_stations():
+        for station in wifi_stations:
             mac = station["mac"].lower()
             if mac in host_macs or mac == "00:00:00:00:00:00":
                 continue
@@ -1078,15 +1233,27 @@ class AgentCore:
                 None,
                 None,
                 now,
+                kind="Wi-Fi client",
+                source="wifi",
+            )
+
+        # A gateway is infrastructure, not a household endpoint.  Remove any
+        # row that was persisted before its MAC was recognised as the router.
+        if gateway_macs:
+            placeholders = ",".join("?" for _ in gateway_macs)
+            self.store.execute(
+                f"DELETE FROM devices WHERE device_id LIKE 'dev-%' "
+                f"AND lower(mac) IN ({placeholders})",
+                tuple(sorted(gateway_macs)),
             )
 
         self.store.commit()
         rows = self.store.execute(
-            "SELECT device_id, name, mac, ipv4, ipv6, assigned_at FROM devices "
-            "ORDER BY assigned_at"
+            "SELECT device_id, name, mac, ipv4, ipv6, assigned_at, kind, source, last_seen "
+            "FROM devices ORDER BY assigned_at"
         ).fetchall()
         devices = [dict(r) for r in rows]
-        self._attach_unknown_flow_devices(devices, subnets, now)
+        self._attach_unknown_flow_devices(devices, subnets, now, gateway, gateway6)
         return devices
 
     def _upsert_device(
@@ -1097,20 +1264,45 @@ class AgentCore:
         ipv4: str | None,
         ipv6: str | None,
         now: float,
+        *,
+        kind: str | None = None,
+        source: str | None = None,
     ) -> None:
         """Insert/update a real device without erasing better-known fields."""
 
+        # A conntrack-only placeholder (dev-ip-*) is superseded by the same
+        # address once ARP/DHCP gives us the MAC.
+        if ipv4:
+            self.store.execute(
+                "DELETE FROM devices WHERE device_id LIKE 'dev-ip-%' AND ipv4=?",
+                (ipv4,),
+            )
+        if ipv6:
+            self.store.execute(
+                "DELETE FROM devices WHERE device_id LIKE 'dev-ip-%' AND ipv6=?",
+                (ipv6,),
+            )
         self.store.execute(
-            "INSERT INTO devices(device_id, name, mac, ipv4, ipv6, assigned_at) "
-            "VALUES (?, ?, ?, ?, ?, ?) "
+            "INSERT INTO devices"
+            "(device_id, name, mac, ipv4, ipv6, assigned_at, kind, source, last_seen) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(device_id) DO UPDATE SET "
             "  mac=COALESCE(excluded.mac, devices.mac), "
             "  ipv4=COALESCE(excluded.ipv4, devices.ipv4), "
             "  ipv6=COALESCE(excluded.ipv6, devices.ipv6), "
+            "  last_seen=excluded.last_seen, "
+            "  kind=CASE "
+            "    WHEN devices.kind='Wi-Fi client' THEN devices.kind "
+            "    WHEN excluded.kind='Wi-Fi client' THEN excluded.kind "
+            "    ELSE COALESCE(excluded.kind, devices.kind) END, "
+            "  source=COALESCE(excluded.source, devices.source), "
             "  name=CASE "
-            "    WHEN excluded.name LIKE 'Device %' OR excluded.name LIKE 'Wi-Fi client %' "
-            "    THEN devices.name ELSE excluded.name END",
-            (device_id, name, mac, ipv4, ipv6, now),
+            "    WHEN excluded.name NOT LIKE 'Device %' "
+            "     AND excluded.name NOT LIKE 'Wi-Fi client %' THEN excluded.name "
+            "    WHEN devices.name LIKE 'Device %' "
+            "      OR devices.name LIKE 'Wi-Fi client %' THEN excluded.name "
+            "    ELSE devices.name END",
+            (device_id, name, mac, ipv4, ipv6, now, kind, source, now),
         )
 
     def _attach_unknown_flow_devices(
@@ -1118,6 +1310,8 @@ class AgentCore:
         devices: list[dict],
         subnets: list[tuple[str, int]],
         now: float,
+        gateway: str | None = None,
+        gateway6: str | None = None,
     ) -> None:
         """Create devices for real LAN source IPs seen in conntrack.
 
@@ -1138,20 +1332,35 @@ class AgentCore:
         changed = False
         for row in rows:
             ip = str(row["src_ip"] or "")
-            if not ip or ip in known or ip.startswith("127.") or ip.startswith("169.254."):
+            if (
+                not ip
+                or ip in known
+                or ip == gateway
+                or ip == gateway6
+                or ip.startswith("127.")
+                or ip.startswith("169.254.")
+            ):
                 continue
             if not any(_ip_in_subnet(ip, local, prefix) for local, prefix in subnets):
                 continue
             device_id = f"dev-ip-{ip.replace('.', '-').replace(':', '-')}"
-            self._upsert_device(device_id, f"Device {ip}", None, ip if ":" not in ip else None,
-                                ip if ":" in ip else None, now)
+            self._upsert_device(
+                device_id,
+                f"Device {ip}",
+                None,
+                ip if ":" not in ip else None,
+                ip if ":" in ip else None,
+                now,
+                kind="LAN device",
+                source="conntrack",
+            )
             known.add(ip)
             changed = True
         if changed:
             self.store.commit()
             rows = self.store.execute(
-                "SELECT device_id, name, mac, ipv4, ipv6, assigned_at FROM devices "
-                "ORDER BY assigned_at"
+                "SELECT device_id, name, mac, ipv4, ipv6, assigned_at, kind, source, last_seen "
+                "FROM devices ORDER BY assigned_at"
             ).fetchall()
             devices[:] = [dict(r) for r in rows]
 
@@ -1458,11 +1667,51 @@ class AgentCore:
         return round(mbps, 4)
 
     def _estimate_capacity(self, now: float):
-        """Run a real throughput probe and update the Kalman estimator."""
-        observation = self._probe_throughput()
-        # Floor at a small positive value so the Kalman filter stays active.
-        observation = max(observation, 0.1)
-        return step_change_detected(self.estimator, observation, self.cusum, dt=1.0)[0]
+        """Estimate capacity from the most recent real fast-loop sample.
+
+        The fast loop is the single owner of the interface counters.  Probing
+        again here would split the same byte delta across two intervals and
+        inflate the rate, so the slow loop reuses its last observation.
+        """
+
+        # The fast loop already fed this exact sample into the Kalman filter.
+        # Re-updating here would double-count one observation per slow tick.
+        return self.estimator.estimate()
+
+    def _update_capacity(self, observation: float):
+        """Update capacity only when there is real traffic to learn from.
+
+        An idle link reports ~0 Mbps, which is not evidence that the link
+        capacity collapsed.  Keep the link-speed prior (or the last measured
+        estimate) while idle; feed the Kalman filter when a real sample exists.
+        """
+
+        if observation < 0.2:
+            # Idle is not a capacity observation.  Do not extrapolate the
+            # trend: a quiet link must not appear to grow without bound.
+            return self.estimator.estimate(), CUSUMResult(
+                triggered=False, statistic=0.0, threshold=self.cusum.threshold
+            )
+        # A physical link cannot carry more than its negotiated speed.  Burst
+        # samples above it are measurement artefacts, not new capacity.
+        if self._link_speed_mbps:
+            observation = min(observation, self._link_speed_mbps)
+        self._capacity_source = "measured"
+        self._capacity_updates += 1
+        estimate, result = step_change_detected(
+            self.estimator, observation, self.cusum, dt=self.config.fast_interval_s
+        )
+        if self._link_speed_mbps:
+            estimate.capacity_mbps = min(estimate.capacity_mbps, self._link_speed_mbps)
+            estimate.hi_mbps = min(estimate.hi_mbps, self._link_speed_mbps)
+        # The first few samples after boot converge from the link-speed prior
+        # to real traffic; that is not a step change.
+        if self._capacity_updates <= 5:
+            self.cusum.reset()
+            result = CUSUMResult(
+                triggered=False, statistic=0.0, threshold=self.cusum.threshold
+            )
+        return estimate, result
 
     def _compute_qoe(
         self,

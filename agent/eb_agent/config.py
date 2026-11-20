@@ -56,6 +56,7 @@ class AgentConfig:
     dead_man_ttl: float = 30.0
     available_interfaces: list[str] = field(default_factory=list)
     log_level: str = "info"
+    agent_id: str = ""
     relay_url: str = ""
     relay_token: str = ""
     site_url: str = "https://example.com"

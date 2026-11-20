@@ -40,6 +40,7 @@ export default function Devices() {
   const [person, setPerson] = useState("");
   const task = useTask("Device details updated.");
   const { data: points = [] } = useApi<MetricPoint[]>("/metrics?range=1h");
+  const onlineCount = snapshot.devices.filter((d) => d.online !== false).length;
   const devices = snapshot.devices
     .filter(
       (d) =>
@@ -60,7 +61,7 @@ export default function Devices() {
       >
         <Badge tone="blue">
           <Wifi size={11} />
-          {snapshot.devices.length} connected
+          {onlineCount} online · {snapshot.devices.length} known
         </Badge>
       </SectionHeading>
       <div className="filter-toolbar">
@@ -156,7 +157,11 @@ export default function Devices() {
                       {f.cls}
                     </span>
                   ))}
-                  {!d.flows.length && <span className="muted">Resting, not disconnected.</span>}
+                  {!d.flows.length && (
+                    <span className="muted">
+                      {d.online === false ? "Offline · last seen recently" : "Resting, not disconnected."}
+                    </span>
+                  )}
                 </div>
                 <footer>
                   <code>{d.ip?.replace(/\.\d+$/, ".•••")}</code>

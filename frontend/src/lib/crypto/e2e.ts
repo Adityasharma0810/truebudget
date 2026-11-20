@@ -34,6 +34,13 @@ function fromBase64(value: string): Uint8Array {
   return bytes;
 }
 
+/** Copy to a plain ArrayBuffer, which WebCrypto's TS types require. */
+function asBuffer(bytes: Uint8Array): ArrayBuffer {
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(bytes);
+  return copy.buffer;
+}
+
 function concat(...arrays: Uint8Array[]): Uint8Array {
   const length = arrays.reduce((total, item) => total + item.length, 0);
   const result = new Uint8Array(length);
@@ -80,7 +87,7 @@ export class SecureChannel {
     if (!this.cryptoKey) {
       this.cryptoKey = await crypto.subtle.importKey(
         "raw",
-        this.key,
+        asBuffer(this.key),
         { name: "AES-GCM" },
         false,
         ["encrypt", "decrypt"]
@@ -98,9 +105,9 @@ export class SecureChannel {
     const aad = concat(AAD_PREFIX, counterBytes(this.sendCounter));
     const ciphertext = new Uint8Array(
       await crypto.subtle.encrypt(
-        { name: "AES-GCM", iv: nonce, additionalData: aad },
+        { name: "AES-GCM", iv: asBuffer(nonce), additionalData: asBuffer(aad) },
         await this.aes(),
-        plaintext
+        asBuffer(plaintext)
       )
     );
     return {
@@ -121,9 +128,9 @@ export class SecureChannel {
     let plaintext: ArrayBuffer;
     try {
       plaintext = await crypto.subtle.decrypt(
-        { name: "AES-GCM", iv: nonce, additionalData: aad },
+        { name: "AES-GCM", iv: asBuffer(nonce), additionalData: asBuffer(aad) },
         await this.aes(),
-        fromBase64(envelope.ct)
+        asBuffer(fromBase64(envelope.ct))
       );
     } catch {
       throw new Error("authentication failed");

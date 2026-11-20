@@ -61,6 +61,13 @@ class AgentIdentity:
         )
         return raw.hex()
 
+    def agreement_private_bytes(self) -> bytes:
+        return self.agreement_private_key.private_bytes(
+            encoding=serialization.Encoding.Raw,  # type: ignore[attr-defined]
+            format=serialization.PrivateFormat.Raw,  # type: ignore[attr-defined]
+            encryption_algorithm=serialization.NoEncryption(),  # type: ignore[attr-defined]
+        )
+
     def save(self, dir_path: Path) -> None:
         dir_path.mkdir(parents=True, exist_ok=True)
         (dir_path / "identity.key").write_bytes(
@@ -195,34 +202,22 @@ class PairingManager:
         self.store = store
         self._attempts: dict[str, list[float]] = {}
         self._secrets: dict[str, PairingSecret] = {}
-        self._load()
+        self.last_error: str | None = None
 
     @staticmethod
     def _hash(key: str) -> str:
         return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
     def _load(self) -> None:
-        execute = getattr(self.store, "execute", None)
-        if not callable(execute):
-            return
-        try:
-            rows = execute(
-                "SELECT key_hash, agent_id, agreement_pub, created_at, expires_at "
-                "FROM pairing_secrets WHERE used=0 AND expires_at > ?",
-                (time.time(),),
-            ).fetchall()
-        except Exception:  # noqa: BLE001 - a FakeStore may not have tables
-            return
-        for row in rows:
-            # The clear key cannot be recovered from a hash; the persisted row
-            # is used only to keep lockout/expiry semantics across restarts.
-            self._secrets[str(row["key_hash"])] = PairingSecret(
-                key=str(row["key_hash"]),
-                agent_id=str(row["agent_id"]),
-                agreement_pub_hex=str(row["agreement_pub"]),
-                created_at=float(row["created_at"]),
-                expires_at=float(row["expires_at"]),
-            )
+        """Compatibility hook.
+
+        Clear pairing keys are never stored, so there is nothing to restore
+        into the in-memory map.  ``consume`` verifies the presented key
+        against the persisted SHA-256 hash, which makes keys survive a daemon
+        restart without keeping the secret at rest.
+        """
+
+        return
 
     def create(self, agent_id: str, agreement_pub_hex: str) -> PairingSecret:
         secret = make_pairing_key()
@@ -271,27 +266,59 @@ class PairingManager:
         return self.create(agent_id, agreement_pub_hex)
 
     def consume(self, key: str) -> PairingSecret | None:
-        ps = self._secrets.get(key)
-        if ps is None:
-            # The key may only exist as a hash after a restart.  A clear key
-            # cannot be matched to it, so this is treated as a failed attempt.
-            self._record_attempt(key)
-            return None
-        if not ps.is_valid():
-            return None
-        ps.used = True
+        """Consume a single-use key, verifying against the persisted hash.
+
+        The database is authoritative so a key created by the CLI (a separate
+        process) or before a daemon restart still works.  The in-memory map is
+        a fallback for stores without SQLite (unit tests).
+        """
+
+        self.last_error = None
+        key_hash = self._hash(key)
         execute = getattr(self.store, "execute", None)
         if callable(execute):
             try:
+                row = execute(
+                    "SELECT agent_id, agreement_pub, created_at, expires_at, used "
+                    "FROM pairing_secrets WHERE key_hash=?",
+                    (key_hash,),
+                ).fetchone()
+            except Exception:  # noqa: BLE001 - FakeStore may not have tables
+                row = None
+            if row is not None:
+                if int(row["used"]):
+                    self.last_error = "used"
+                    return None
+                if float(row["expires_at"]) <= time.time():
+                    self.last_error = "expired"
+                    return None
                 execute(
                     "UPDATE pairing_secrets SET used=1 WHERE key_hash=?",
-                    (self._hash(key),),
+                    (key_hash,),
                 )
                 commit = getattr(self.store, "commit", None)
                 if callable(commit):
                     commit()
-            except Exception:  # noqa: BLE001
-                pass
+                self._secrets.pop(key, None)
+                return PairingSecret(
+                    key=key,
+                    agent_id=str(row["agent_id"]),
+                    agreement_pub_hex=str(row["agreement_pub"]),
+                    created_at=float(row["created_at"]),
+                    used=True,
+                    expires_at=float(row["expires_at"]),
+                )
+
+        ps = self._secrets.get(key)
+        if ps is None:
+            self._record_attempt(key)
+            self.last_error = "invalid"
+            return None
+        if not ps.is_valid():
+            self.last_error = "expired" if time.time() >= ps.expires_at else "used"
+            return None
+        ps.used = True
+        self._secrets.pop(key, None)
         return ps
 
     def _record_attempt(self, key: str) -> None:

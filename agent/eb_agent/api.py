@@ -29,6 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from eb_agent.config import AgentConfig
 from eb_agent.core import AgentCore, Snapshot, Tick
+from eb_agent.bridge import RelayBridge, bridge_status
 from eb_agent.decision_log import DecisionLog, GENESIS_HASH
 from eb_agent.health import get_health_service
 from eb_agent.intents import IntentService
@@ -48,6 +49,7 @@ from eb_agent.security import (
     make_pairing_key,
     make_pairing_link,
 )
+from eb_agent.tls import fingerprint_of
 from eb_agent.store import Store
 
 APP_VERSION = "0.1.0"
@@ -318,8 +320,22 @@ def _snapshot_to_frontend(core: AgentCore, config: AgentConfig, store: Store) ->
         if person:
             device_out["person"] = str(person)
         kind = dev.get("kind") or dev.get("type")
-        if kind:
-            device_out["type"] = kind
+        if not kind:
+            kind = "Host" if did.startswith("host-") else "LAN device"
+        device_out["type"] = kind
+        last_seen = dev.get("last_seen") or dev.get("assigned_at")
+        try:
+            last_seen_value = float(last_seen) if last_seen is not None else None
+        except (TypeError, ValueError):
+            last_seen_value = None
+        online = did.startswith("host-") or (
+            last_seen_value is not None and time.time() - last_seen_value < 120.0
+        )
+        device_out["online"] = bool(online)
+        if last_seen_value is not None:
+            device_out["lastSeen"] = _iso(last_seen_value)
+        if dev.get("source"):
+            device_out["source"] = str(dev["source"])
         ip = dev.get("ipv4")
         if ip:
             device_out["ip"] = ip
@@ -371,6 +387,7 @@ def _snapshot_to_frontend(core: AgentCore, config: AgentConfig, store: Store) ->
         "mode": _mode_label(config.mode),
         "link": {
             "capacityMbps": round(capacity, 2),
+            "capacitySource": getattr(core, "_capacity_source", "prior"),
             "uncertaintyMbps": round(uncertainty, 2),
             "forecast": [
                 {
@@ -407,12 +424,10 @@ def _snapshot_to_frontend(core: AgentCore, config: AgentConfig, store: Store) ->
 
 
 def _mode_label(mode: str) -> str:
-    return {
-        "gateway": "adaptive",
-        "bridge": "adaptive",
-        "lab": "adaptive",
-        "monitor": "safe_state",
-    }.get(mode, "adaptive")
+    # Topology mode (gateway/bridge/lab/monitor) is shown separately from the
+    # control-loop state.  Monitor-only is still an adaptive read-only loop, not
+    # the emergency safe state.
+    return "adaptive"
 
 
 def _json_dict(raw: Any) -> dict[str, Any]:
@@ -714,15 +729,15 @@ def create_app(
         origin.strip()
         for origin in os.environ.get(
             "EB_CORS_ORIGINS",
-            "http://localhost:8443,http://127.0.0.1:8443,http://0.0.0.0:8443",
+            "http://localhost:8443,http://127.0.0.1:8443,"
+            "http://localhost:5173,http://127.0.0.1:5173",
         ).split(",")
         if origin.strip()
     ]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=allowed_origins or ["*"],
-        allow_origin_regex=os.environ.get("EB_CORS_ORIGIN_REGEX")
-        or r"https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)(:\d+)?",
+        allow_origins=allowed_origins,
+        allow_origin_regex=os.environ.get("EB_CORS_ORIGIN_REGEX") or None,
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -746,6 +761,7 @@ def create_app(
     app.state.federated = federated
     app.state.ask = ask_service
     app.state.dev_control = dev_control
+    app.state.bridge = None
     app.state.session_sockets = {}
     app.state._started = time.time()
 
@@ -799,6 +815,39 @@ def create_app(
             )
             response.headers["Retry-After"] = str(int(max(1, retry_after or 1)))
             return response
+
+        # Mutating calls require a live owner session.  Reads stay available so
+        # the public landing page and a fresh browser can render before pairing;
+        # the relay bridge applies the same rule to every forwarded request.
+        public_mutations = {
+            "/api/v1/pair",
+            "/api/v1/session/refresh",
+        }
+        if (
+            request.method in {"POST", "PUT", "PATCH", "DELETE"}
+            and request.url.path not in public_mutations
+            and client_host != "testclient"
+        ):
+            sessions_mgr: Optional[SessionManager] = getattr(app.state, "sessions", None)
+            header = request.headers.get("authorization", "")
+            token = header[7:].strip() if header.lower().startswith("bearer ") else ""
+            session = sessions_mgr.authenticate(token) if sessions_mgr and token else None
+            if session is None:
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "code": "auth_required",
+                        "message": "Pair this browser before changing agent state.",
+                    },
+                )
+            if session.role != "owner":
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "code": "read_only_session",
+                        "message": "This session is read-only.",
+                    },
+                )
 
         idem = (
             request.headers.get("Idempotency-Key")
@@ -940,7 +989,7 @@ def create_app(
             emulated=False,
             agent_id=identity.agent_id if identity else "",
             agreement_public_key=identity.agreement_public_hex() if identity else "",
-            relay_url=os.environ.get("RELAY_URL", ""),
+            relay_url=config.relay_url,
         )
 
     @app.get("/api/v1/state/snapshot")
@@ -1033,6 +1082,11 @@ def create_app(
             if session is not None:
                 sessions_mgr.revoke(session.session_id)
                 app.state.session_sockets.pop(session.session_id, None)
+
+    @app.get("/api/v1/relay/status")
+    async def relay_status():
+        bridge: Optional[RelayBridge] = getattr(app.state, "bridge", None)
+        return bridge_status(bridge)
 
     @app.get("/api/v1/metrics")
     async def metrics(range: str = "1h", device: str = "all"):
@@ -1543,16 +1597,23 @@ def create_app(
             host = socket.gethostname()
         except OSError:
             host = "unknown"
+        cert_path = config.data_dir / "tls" / "cert.pem"
+        tls_fingerprint = fingerprint_of(cert_path) if cert_path.exists() else ""
         return {
             "hostname": host,
             "os": f"{uname.system} {uname.release}",
             "version": APP_VERSION,
             "uptime": _duration(uptime_s),
             "dbSize": _bytes_label(db_size),
-            "relay": "local WebSocket /api/v1/stream",
+            "relay": config.relay_url or "local WebSocket /api/v1/stream",
+            "relayUrl": config.relay_url,
+            "mode": config.mode,
             "loopMs": round(loop_ms, 2),
             "seed": 0,
             "emulated": bool(snap.emulated) if snap else False,
+            "tlsFingerprint": tls_fingerprint,
+            "tlsEnabled": bool(config.tls),
+            "mdns": bool(config.mdns),
         }
 
     @app.get("/api/v1/agent/logs")
@@ -2032,11 +2093,17 @@ def create_app(
             )
         secret = pairing.consume(key)
         if secret is None:
+            reason = getattr(pairing, "last_error", None) or "invalid"
+            messages = {
+                "expired": "This pairing key has expired. Generate a new one with `eb-agent pair`.",
+                "used": "This pairing key was already used. Generate a new one with `eb-agent pair`.",
+                "invalid": "This pairing key is invalid. Check the key or generate a new one.",
+            }
             raise HTTPException(
                 status_code=401,
                 detail={
-                    "code": "invalid_pairing_key",
-                    "message": "This pairing key is invalid, expired, or already used.",
+                    "code": f"pairing_{reason}",
+                    "message": messages.get(reason, messages["invalid"]),
                 },
             )
         client_host = request.client.host if request.client else ""
@@ -2096,6 +2163,37 @@ def create_app(
             "sessionId": new_session.session_id,
             "accessToken": tokens.access_token,
             "refreshToken": tokens.refresh_token,
+        }
+
+    @app.get("/api/v1/session")
+    async def session_info(request: Request):
+        """Resolve a bearer token to its live session (used by the relay bridge)."""
+
+        sessions_mgr: Optional[SessionManager] = app.state.sessions
+        if sessions_mgr is None:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "sessions_unavailable", "message": "Sessions unavailable."},
+            )
+        header = request.headers.get("authorization", "")
+        token = header[7:].strip() if header.lower().startswith("bearer ") else ""
+        if not token:
+            raise HTTPException(
+                status_code=401,
+                detail={"code": "auth_required", "message": "A bearer token is required."},
+            )
+        session = sessions_mgr.authenticate(token)
+        if session is None:
+            raise HTTPException(
+                status_code=401,
+                detail={"code": "invalid_session", "message": "The session token is invalid or revoked."},
+            )
+        return {
+            "ok": True,
+            "sessionId": session.session_id,
+            "agentId": session.agent_id,
+            "role": session.role,
+            "expiresAt": _iso(session.expires_at),
         }
 
     @app.get("/api/v1/sessions")
@@ -2268,9 +2366,13 @@ def run_server(
     federated=None,
     ask_service=None,
     dev_control=None,
+    ssl_certfile: str | None = None,
+    ssl_keyfile: str | None = None,
 ) -> None:
     """Create the FastAPI app, start the control loops, and serve uvicorn."""
 
+    if identity is not None and not config.agent_id:
+        config.agent_id = identity.agent_id
     app = create_app(
         config,
         core,
@@ -2287,6 +2389,18 @@ def run_server(
         ask_service=ask_service,
         dev_control=dev_control,
     )
+
+    bridge: Optional[RelayBridge] = None
+    if identity is not None and config.relay_url:
+        scheme = "https" if config.tls else "http"
+        bridge = RelayBridge(
+            config,
+            identity,
+            local_url=f"{scheme}://127.0.0.1:{port}",
+            relay_url=config.relay_url,
+            relay_token=config.relay_token,
+        )
+        app.state.bridge = bridge
 
     @app.on_event("startup")
     async def _startup():
@@ -2312,15 +2426,22 @@ def run_server(
             logger.exception("classifier bootstrap failed; rule baseline active")
             logger.warning("classifier bootstrap error: %s", error)
         await core.start()
+        if bridge is not None:
+            await bridge.start()
 
     @app.on_event("shutdown")
     async def _shutdown():
+        if bridge is not None:
+            await bridge.stop()
         await core.stop()
 
     try:
         from uvicorn import Config, Server
 
         server_config = Config(app, host=host, port=port, log_level="info")
+        if ssl_certfile and ssl_keyfile:
+            server_config.ssl_certfile = ssl_certfile
+            server_config.ssl_keyfile = ssl_keyfile
         server = Server(server_config)
         import asyncio
 
@@ -2376,24 +2497,70 @@ if __name__ == "__main__":
     identity = load_or_create_identity(config.data_dir)
     host = os.environ.get("EB_AGENT_HOST", "0.0.0.0")
     port = int(os.environ.get("EB_AGENT_PORT", "7443"))
-    print(f"eb-agentd serving on http://{host}:{port} (mode={config.mode}, agent={identity.agent_id})")
-    run_server(
-        config,
-        core,
-        store,
-        host=host,
-        port=port,
-        decision_log=decision_log,
-        intent_service=intent_service,
-        pairing=pairing,
-        sessions=sessions,
-        identity=identity,
-        health=health,
-        negotiation=negotiation,
-        experiments=experiments,
-        federated=federated,
-        ask_service=ask_service,
-        dev_control=dev_control,
+    tls_enabled = bool(config.tls) or os.environ.get("EB_TLS", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    certfile: str | None = None
+    keyfile: str | None = None
+    tls_fingerprint = ""
+    if tls_enabled:
+        from eb_agent.tls import ensure_self_signed_cert
+
+        material = ensure_self_signed_cert(config.data_dir)
+        config.tls = True
+        certfile = str(material.cert_path)
+        keyfile = str(material.key_path)
+        tls_fingerprint = material.fingerprint
+        print(f"TLS certificate SHA-256: {tls_fingerprint}")
+
+    zeroconf = None
+    if config.mdns:
+        try:
+            from eb_agent.mdns import start_mdns
+
+            zeroconf = start_mdns(
+                agent_id=identity.agent_id,
+                port=port,
+                fingerprint=tls_fingerprint,
+            )
+        except Exception:  # noqa: BLE001 - discovery is optional
+            logging.getLogger("eb_agent.mdns").warning(
+                "mDNS advertisement failed", exc_info=True
+            )
+
+    scheme = "https" if tls_enabled else "http"
+    print(
+        f"eb-agentd serving on {scheme}://{host}:{port} "
+        f"(mode={config.mode}, agent={identity.agent_id})"
     )
+    try:
+        run_server(
+            config,
+            core,
+            store,
+            host=host,
+            port=port,
+            decision_log=decision_log,
+            intent_service=intent_service,
+            pairing=pairing,
+            sessions=sessions,
+            identity=identity,
+            health=health,
+            negotiation=negotiation,
+            experiments=experiments,
+            federated=federated,
+            ask_service=ask_service,
+            dev_control=dev_control,
+            ssl_certfile=certfile,
+            ssl_keyfile=keyfile,
+        )
+    finally:
+        if zeroconf is not None:
+            from eb_agent.mdns import stop_mdns
+
+            stop_mdns(zeroconf)
 
 

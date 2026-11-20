@@ -8,8 +8,10 @@ The relay sees ciphertext only -- E2E crypto happens at the endpoints.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
+import os
 import time
 import uuid
 from collections import defaultdict
@@ -79,8 +81,20 @@ class Relay:
 
     # ------------------------------------------------------------------ connection handling
 
-    async def connect(self, ws: WebSocket, kind: str, agent_id: Optional[str] = None) -> str:
+    async def connect(
+        self,
+        ws: WebSocket,
+        kind: str,
+        agent_id: Optional[str] = None,
+        token: Optional[str] = None,
+    ) -> str:
         await ws.accept()
+        expected = os.environ.get("RELAY_AGENT_TOKEN", "")
+        if kind == "agent" and expected:
+            provided = token or ""
+            if not hmac.compare_digest(provided, expected):
+                await ws.close(code=status.WS_1008_POLICY_VIOLATION)
+                raise RuntimeError("invalid relay agent token")
         conn_id = uuid.uuid4().hex
         if len(self._connections) >= MAX_CONNECTIONS:
             await ws.close(code=status.WS_1013_TRY_AGAIN_LATER)
@@ -99,6 +113,8 @@ class Relay:
             "relay connect",
             extra={"conn_id": conn_id, "kind": kind, "agent_id": agent_id},
         )
+        if kind == "agent" and agent_id:
+            await self._broadcast_presence(agent_id, True)
         return conn_id
 
     async def disconnect(self, conn_id: str) -> None:
@@ -187,6 +203,32 @@ class Relay:
                     await self.disconnect(aid)
 
     # ------------------------------------------------------------------ presence
+
+    async def _broadcast_presence(self, agent_id: str, online: bool) -> None:
+        """Tell browsers in this room that the agent came online/offline."""
+
+        payload = json.dumps(
+            {
+                "type": "presence",
+                "agentId": agent_id,
+                "online": online,
+                "ts": time.time(),
+            },
+            separators=(",", ":"),
+        )
+        async with self._lock:
+            browser_ids = [
+                c.conn_id
+                for c in self._connections.values()
+                if c.kind == "browser" and c.agent_id == agent_id
+            ]
+        for bid in browser_ids:
+            conn = self._connections.get(bid)
+            if conn:
+                try:
+                    await conn.ws.send_text(payload)
+                except Exception:
+                    await self.disconnect(bid)
 
     def get_presence(self, agent_id: str) -> dict:
         p = self._presence.get(agent_id)

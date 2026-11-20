@@ -69,10 +69,23 @@ def _print_pairing(config: AgentConfig, store: Store, identity) -> None:
     pairing = PairingManager(store)
     secret = pairing.rotate(identity.agent_id, identity.agreement_public_hex())
     site = os.environ.get("EB_SITE_URL", "https://example.com")
+    fingerprint = ""
+    if config.tls:
+        try:
+            from eb_agent.tls import ensure_self_signed_cert
+
+            fingerprint = ensure_self_signed_cert(config.data_dir).fingerprint
+        except Exception:  # noqa: BLE001 - a missing cert must not block pairing
+            fingerprint = ""
     link = (
         f"{site.rstrip('/')}/connect?key={secret.key}"
+        f"&agent={identity.agent_id}"
         f"#pk={identity.agreement_public_hex()}"
     )
+    if fingerprint:
+        from urllib.parse import quote
+
+        link += f"&fp={quote(fingerprint)}"
     print(f"Agent ID:     {identity.agent_id}")
     print(f"Data dir:     {config.data_dir}")
     print(f"Pairing key:  {secret.key}")

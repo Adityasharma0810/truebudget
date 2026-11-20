@@ -31,6 +31,13 @@ import { Topology } from "../../components/Topology";
 import { useApi, transport, setTransport } from "../../lib/api";
 import { DirectTransport } from "../../lib/transport/DirectTransport";
 import { RelayTransport } from "../../lib/transport/RelayTransport";
+import {
+  getActiveAgent,
+  listAgents,
+  removeAgent,
+  setActiveAgent,
+  type StoredAgent,
+} from "../../lib/transport/session";
 import type { Capabilities, Snapshot } from "../../types";
 import { Reveal } from "../../motion/primitives";
 function PublicHeader() {
@@ -293,37 +300,66 @@ export function Connect() {
   const navigate = useNavigate();
   const [parts, setParts] = useState(["", "", ""]);
   const [reveal, setReveal] = useState(false);
-  const [remember, setRemember] = useState(false);
-  const [choice, setChoice] = useState("relay");
-  const [host, setHost] = useState("192.168.1.2:8080");
+  const [remember, setRemember] = useState(true);
+  const [choice, setChoice] = useState<"relay" | "direct">("relay");
+  const [host, setHost] = useState("localhost:7443");
   const [stage, setStage] = useState(0);
   const [error, setError] = useState("");
+  const [savedAgents, setSavedAgents] = useState<StoredAgent[]>([]);
+  const [linkAgent, setLinkAgent] = useState("");
+  const [linkPk, setLinkPk] = useState("");
+  const [linkFp, setLinkFp] = useState("");
   const inputs = useRef<(HTMLInputElement | null)[]>([]);
-  const [saved, setSaved] = useState(false);
+
+  function splitKey(value: string): string[] {
+    const compact = value
+      .trim()
+      .toUpperCase()
+      .replace(/^EB-/, "")
+      .replace(/[^A-Z0-9]/g, "")
+      .slice(0, 12);
+    return [compact.slice(0, 4), compact.slice(4, 8), compact.slice(8, 12)];
+  }
+
+  function absorbLink(value: string) {
+    const raw = value.trim();
+    if (!raw) return;
+    let key = raw;
+    try {
+      const parsed = new URL(raw);
+      key = parsed.searchParams.get("key") ?? raw;
+      setLinkAgent(parsed.searchParams.get("agent") ?? "");
+      const fragment = new URLSearchParams(parsed.hash.replace(/^#/, ""));
+      setLinkPk(fragment.get("pk") ?? "");
+      setLinkFp(fragment.get("fp") ?? "");
+    } catch {
+      /* a bare key is also accepted */
+    }
+    setParts(splitKey(key));
+  }
+
   useEffect(() => {
+    setSavedAgents(listAgents());
+    try {
+      setHost(`${location.hostname || "localhost"}:7443`);
+    } catch {
+      setHost("localhost:7443");
+    }
     const url = new URL(location.href);
-    const raw = url.searchParams.get("key");
-    if (raw) {
-      setParts(raw.replace(/^EB-/i, "").toUpperCase().split("-").slice(0, 3));
+    const rawKey = url.searchParams.get("key");
+    const agent = url.searchParams.get("agent");
+    const fragment = new URLSearchParams(url.hash.replace(/^#/, ""));
+    if (agent) setLinkAgent(agent);
+    if (fragment.get("pk")) setLinkPk(fragment.get("pk") ?? "");
+    if (fragment.get("fp")) setLinkFp(fragment.get("fp") ?? "");
+    if (rawKey) {
+      setParts(splitKey(rawKey));
+      // The single-use key must not stay in the address bar or history.
       url.searchParams.delete("key");
       history.replaceState({}, "", url.pathname + url.search + url.hash);
     }
-    try {
-      setSaved(!!localStorage.getItem("eb-key"));
-    } catch {}
   }, []);
-  function paste(text: string) {
-    let key = text.trim();
-    try {
-      const u = new URL(text);
-      key = u.searchParams.get("key") ?? key;
-    } catch {}
-    const p = key
-      .toUpperCase()
-      .replace(/^EB-/, "")
-      .replace(/[^A-Z0-9]/g, "");
-    setParts([p.slice(0, 4), p.slice(4, 8), p.slice(8, 12)]);
-  }
+
   async function connect() {
     setError("");
     const key = "EB-" + parts.join("-");
@@ -333,28 +369,83 @@ export function Connect() {
     }
     try {
       setStage(1);
-      await new Promise((r) => setTimeout(r, 400));
-      setStage(2);
-      // Select the real transport based on the user's connection method.
+      let selected: RelayTransport;
       if (choice === "direct") {
-        setTransport(new DirectTransport(undefined, host));
+        if (!host.trim()) throw new Error("Enter the agent's LAN host and port.");
+        selected = new DirectTransport(linkFp || undefined, host.trim());
       } else {
-        setTransport(new RelayTransport());
+        if (!linkAgent) {
+          throw new Error(
+            "This pairing link is missing the agent id. Run `eb-agent pair` and open the full link (it contains ?agent=…).",
+          );
+        }
+        selected = new RelayTransport({
+          mode: "relay",
+          agentId: linkAgent,
+          publicKey: linkPk || undefined,
+          fingerprint: linkFp || undefined,
+        });
       }
-      await transport.connect(key);
+      setTransport(selected);
+      setStage(2);
+      await selected.connect(key);
       setStage(3);
-      await new Promise((r) => setTimeout(r, 400));
-      if (remember)
-        try {
-          localStorage.setItem("eb-key", key);
-        } catch {}
+      if (!remember && selected.agentId) {
+        removeAgent(selected.agentId);
+      }
+      setSavedAgents(listAgents());
+      useToasts.getState().push(
+        selected.mode === "relay"
+          ? "Connected through the relay with an end-to-end encrypted channel."
+          : "Connected directly to your local agent.",
+      );
       navigate("/app");
-      useToasts.getState().push("Connected to your local agent.");
     } catch (e) {
       setStage(0);
       setError(e instanceof Error ? e.message : "Connection failed.");
+      setSavedAgents(listAgents());
     }
   }
+
+  async function switchAgent(agent: StoredAgent) {
+    setError("");
+    setStage(1);
+    try {
+      setActiveAgent(agent.agentId);
+      const selected =
+        agent.mode === "direct"
+          ? new DirectTransport(agent.fingerprint, agent.httpUrl)
+          : new RelayTransport({
+              mode: "relay",
+              relayUrl: agent.relayUrl,
+              agentId: agent.agentId,
+              publicKey: agent.publicKey,
+              fingerprint: agent.fingerprint,
+              accessToken: agent.accessToken,
+              refreshToken: agent.refreshToken,
+            });
+      setTransport(selected);
+      setStage(2);
+      await selected.connect("");
+      setStage(3);
+      setSavedAgents(listAgents());
+      navigate("/app");
+    } catch (e) {
+      setStage(0);
+      setError(e instanceof Error ? e.message : "Could not reopen this agent.");
+      setSavedAgents(listAgents());
+    }
+  }
+
+  function forgetAgent(agentId: string) {
+    const wasActive = getActiveAgent()?.agentId === agentId;
+    removeAgent(agentId);
+    if (wasActive) {
+      void (transport as RelayTransport).disconnect?.();
+    }
+    setSavedAgents(listAgents());
+  }
+
   return (
     <div className="public-page">
       <PublicHeader />
@@ -382,13 +473,13 @@ export function Connect() {
         <div className="card pairing-card">
           <div className="row-between">
             <h3>Your pairing key</h3>
-            <Badge tone="blue">Optional locally</Badge>
+            <Badge tone="blue">{linkAgent ? "Linked agent" : "Single use"}</Badge>
           </div>
           <div
             className={`key-input ${error ? "input-error" : ""}`}
             onPaste={(e) => {
               e.preventDefault();
-              paste(e.clipboardData.getData("text"));
+              absorbLink(e.clipboardData.getData("text"));
             }}
           >
             <span>EB</span>
@@ -425,12 +516,22 @@ export function Connect() {
             </button>
           </div>
           <p className="field-hint">
-            Local read-only access does not require a pairing key in this build. A well-formed key
-            from <code>eb-agent pair</code> is still accepted.
+            Paste the whole link from <code>eb-agent pair</code> to include the agent id, public
+            key, and TLS fingerprint. A bare key works for Direct LAN.
           </p>
+          {linkAgent && (
+            <p className="field-hint">
+              Agent <code>{linkAgent}</code>
+              {linkPk ? " · E2E public key pinned" : " · no public key in link (first-use trust)"}
+              {linkFp ? " · TLS fingerprint pinned" : ""}
+            </p>
+          )}
           <label className="field-label">
             Connection method
-            <select value={choice} onChange={(e) => setChoice(e.target.value)}>
+            <select
+              value={choice}
+              onChange={(e) => setChoice(e.target.value as "relay" | "direct")}
+            >
               <option value="relay">Relay · recommended</option>
               <option value="direct">Direct LAN</option>
             </select>
@@ -456,20 +557,38 @@ export function Connect() {
             Remember this agent on this browser
           </label>
           <p className="field-hint">
-            Stores the pairing key locally. Use only on a trusted device.
+            Stores scoped session tokens, never the single-use pairing key. Use only on a trusted
+            device.
           </p>
-          {saved && (
-            <button
-              className="text-link"
-              onClick={() => {
-                try {
-                  localStorage.removeItem("eb-key");
-                } catch {}
-                setSaved(false);
-              }}
-            >
-              Forget remembered agent
-            </button>
+          {savedAgents.length > 0 && (
+            <div className="saved-agents">
+              <div className="row-between">
+                <h3>Saved agents</h3>
+                <Badge tone="blue">{savedAgents.length}</Badge>
+              </div>
+              {savedAgents.map((agent) => (
+                <div className="saved-agent" key={agent.agentId}>
+                  <div>
+                    <strong>{agent.name || agent.agentId}</strong>
+                    <div className="field-hint">
+                      {agent.mode === "relay" ? "Relay · E2E" : "Direct LAN"} · {agent.agentId}
+                    </div>
+                  </div>
+                  <div className="saved-agent-actions">
+                    <Button
+                      variant="secondary"
+                      onClick={() => void switchAgent(agent)}
+                      pending={stage > 0}
+                    >
+                      Open
+                    </Button>
+                    <Button variant="ghost" onClick={() => forgetAgent(agent.agentId)}>
+                      Forget
+                    </Button>
+                  </div>
+                </div>
+              ))}
+            </div>
           )}
           {error && (
             <p className="inline-error" role="alert">
@@ -502,6 +621,7 @@ export function Connect() {
     </div>
   );
 }
+
 export function About({ embedded = false }: { embedded?: boolean }) {
   const { data: formulas, error } = useApi<Record<string, string>>("/qoe/formulas");
   const { data: snapshot } = useApi<Snapshot>("/state/snapshot");

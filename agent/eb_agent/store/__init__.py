@@ -16,11 +16,12 @@ import json
 import os
 import shutil
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Iterable
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -335,7 +336,15 @@ CREATE TABLE IF NOT EXISTS model_updates (
 CREATE INDEX IF NOT EXISTS idx_model_updates_created ON model_updates(created_at);
 """
 
-MIGRATIONS: dict[int, str] = {1: SCHEMA_SQL, 2: MIGRATION_2, 3: MIGRATION_3}
+MIGRATION_4 = """
+ALTER TABLE devices ADD COLUMN kind TEXT;
+ALTER TABLE devices ADD COLUMN source TEXT;
+ALTER TABLE devices ADD COLUMN last_seen REAL;
+
+CREATE INDEX IF NOT EXISTS idx_devices_last_seen ON devices(last_seen);
+"""
+
+MIGRATIONS: dict[int, str] = {1: SCHEMA_SQL, 2: MIGRATION_2, 3: MIGRATION_3, 4: MIGRATION_4}
 
 
 class Store:
@@ -346,6 +355,7 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.path), isolation_level=None, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._lock = threading.RLock()
         self._init()
 
     # ------------------------------------------------------------------ init
@@ -395,35 +405,42 @@ class Store:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest_conn = sqlite3.connect(str(dest))
         try:
-            self._conn.backup(dest_conn)
+            with self._lock:
+                self._conn.backup(dest_conn)
         finally:
             dest_conn.close()
         return dest
 
     def restore(self, src: Path | str) -> None:
         src = Path(src)
-        self._conn.close()
-        shutil.copy2(src, self.path)
-        self._conn = sqlite3.connect(str(self.path), isolation_level=None, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._init()
+        with self._lock:
+            self._conn.close()
+            shutil.copy2(src, self.path)
+            self._conn = sqlite3.connect(str(self.path), isolation_level=None, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._init()
 
     def vacuum(self) -> None:
-        self._conn.execute("VACUUM")
+        with self._lock:
+            self._conn.execute("VACUUM")
 
     # ------------------------------------------------------------------ generic execute
 
     def execute(self, sql: str, params: Iterable = ()) -> sqlite3.Cursor:
-        return self._conn.execute(sql, tuple(params))
+        with self._lock:
+            return self._conn.execute(sql, tuple(params))
 
     def executemany(self, sql: str, params: Iterable[Iterable]) -> sqlite3.Cursor:
-        return self._conn.executemany(sql, [tuple(p) for p in params])
+        with self._lock:
+            return self._conn.executemany(sql, [tuple(p) for p in params])
 
     def commit(self) -> None:
-        self._conn.commit()
+        with self._lock:
+            self._conn.commit()
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     # ------------------------------------------------------------------ retention
 
@@ -431,24 +448,25 @@ class Store:
         """Delete raw features older than raw_seconds; aggregates older than agg_days."""
 
         now = time.time()
-        self._conn.execute(
-            "DELETE FROM metrics_raw WHERE ts < ?", (now - raw_seconds,)
-        )
-        self._conn.execute(
-            "DELETE FROM flow_features WHERE updated_at < ?",
-            (now - raw_seconds,),
-        )
-        self._conn.execute(
-            "DELETE FROM metrics_agg WHERE ts_bucket < ?",
-            (now - agg_days * 86400,),
-        )
-        self._conn.execute(
-            "DELETE FROM qoe_scores WHERE ts < ?", (now - raw_seconds,)
-        )
-        self._conn.execute(
-            "DELETE FROM pairing_attempts WHERE ts < ?", (now - 3600.0,)
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM metrics_raw WHERE ts < ?", (now - raw_seconds,)
+            )
+            self._conn.execute(
+                "DELETE FROM flow_features WHERE updated_at < ?",
+                (now - raw_seconds,),
+            )
+            self._conn.execute(
+                "DELETE FROM metrics_agg WHERE ts_bucket < ?",
+                (now - agg_days * 86400,),
+            )
+            self._conn.execute(
+                "DELETE FROM qoe_scores WHERE ts < ?", (now - raw_seconds,)
+            )
+            self._conn.execute(
+                "DELETE FROM pairing_attempts WHERE ts < ?", (now - 3600.0,)
+            )
+            self._conn.commit()
 
     # ------------------------------------------------------------------ scheduled maintenance
 

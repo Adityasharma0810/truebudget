@@ -29,14 +29,17 @@ def test_make_pairing_key_format() -> None:
     key = make_pairing_key()
     parts = key.split("-")
     assert parts[0] == "EB"
-    assert len(parts) == 5
-    assert all(len(p) == 8 for p in parts[1:])
+    assert len(parts) == 4
+    assert all(len(p) == 4 for p in parts[1:])
+    assert key == key.upper()
 
 
 def test_make_pairing_link() -> None:
-    link = make_pairing_link("https://example.com", "agent-1", "abc123")
+    link = make_pairing_link("https://example.com", "agent-1", "abc123", "AA:BB")
     assert "https://example.com/connect?key=" in link
+    assert "agent=agent-1" in link
     assert "#pk=abc123" in link
+    assert "fp=AA%3ABB" in link
 
 
 def test_pairing_consume_valid() -> None:
@@ -56,7 +59,7 @@ def test_pairing_consume_invalid() -> None:
         pass
 
     pm = PairingManager(FakeStore())
-    assert pm.consume("EB-0000-0000-0000-0000") is None
+    assert pm.consume("EB-0000-0000-0000") is None
 
 
 def test_pairing_single_use() -> None:
@@ -85,8 +88,8 @@ def test_pairing_lockout() -> None:
 
     pm = PairingManager(FakeStore())
     for _ in range(5):
-        pm.consume("EB-0000-0000-0000-0000")
-    assert pm.is_locked_out("EB-0000-0000-0000-0000") is True
+        pm.consume("EB-0000-0000-0000")
+    assert pm.is_locked_out("EB-0000-0000-0000") is True
 
 
 def test_session_create_revoke() -> None:
@@ -126,3 +129,33 @@ def test_identity_save_chmod(tmp_path) -> None:
     assert (tmp_path / "agreement.key").exists()
     mode = (tmp_path / "identity.key").stat().st_mode & 0o777
     assert mode == 0o600
+
+
+def test_pairing_key_survives_restart(tmp_path) -> None:
+    from eb_agent.store import Store
+
+    store = Store(tmp_path / "eb.db")
+    first = PairingManager(store)
+    secret = first.create("agent-1", "pubhex")
+
+    # A new process (CLI or daemon restart) has no in-memory clear keys.
+    second = PairingManager(store)
+    consumed = second.consume(secret.key)
+    assert consumed is not None
+    assert consumed.agent_id == "agent-1"
+    assert consumed.used is True
+    # Single use is enforced by the persisted hash too.
+    third = PairingManager(store)
+    assert third.consume(secret.key) is None
+    assert third.last_error == "used"
+    store.close()
+
+
+def test_pairing_unknown_key_reports_invalid(tmp_path) -> None:
+    from eb_agent.store import Store
+
+    store = Store(tmp_path / "eb.db")
+    manager = PairingManager(store)
+    assert manager.consume("EB-0000-0000-0000") is None
+    assert manager.last_error == "invalid"
+    store.close()
