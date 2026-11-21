@@ -1,0 +1,15 @@
+import { chromium } from "@playwright/test";
+const b = await chromium.launch();
+const p = await b.newPage({ viewport: { width: 1440, height: 900 } });
+const lines = [];
+p.on("console", m => { if (m.type() !== 'debug') lines.push(`CONSOLE ${m.type()} ${m.text().slice(0,300)}`); });
+p.on("response", r => { if (r.url().includes("7443") || r.url().includes("api")) lines.push(`HTTP ${r.status()} ${r.request().method()} ${r.url()} :: ${''}`); });
+p.on("requestfailed", r => lines.push(`FAILED ${r.method()} ${r.url()} :: ${r.failure()?.errorText}`));
+p.on("pageerror", e => lines.push(`PAGEERROR ${e.message.slice(0, 500)}`));
+await p.goto("http://localhost:8443/app", { waitUntil: "domcontentloaded", timeout: 20000 });
+await p.waitForTimeout(12000);
+console.log(lines.slice(0, 40).join("\n"));
+const txt = await p.locator("body").innerText();
+console.log("TEXTLEN", txt.length, txt.slice(0,300).replace(/\n/g," | "));
+console.log("HTML", (await p.locator("#root").innerHTML()).slice(0, 400));
+await b.close();

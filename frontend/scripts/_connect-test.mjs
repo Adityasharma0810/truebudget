@@ -1,0 +1,11 @@
+import { chromium } from "@playwright/test";
+const b = await chromium.launch();
+const p = await b.newPage({ viewport: { width: 1440, height: 900 } });
+const lines=[];
+p.on("pageerror", e => lines.push("PAGEERROR "+e.message));
+p.on("requestfailed", r => lines.push(`FAILED ${r.url()} ${r.failure()?.errorText}`));
+await p.goto("http://localhost:8443/connect", { waitUntil: "domcontentloaded", timeout: 20000 });
+await p.waitForTimeout(3000);
+console.log((await p.locator("body").innerText()).slice(0,800));
+console.log(lines.join("\n"));
+await b.close();

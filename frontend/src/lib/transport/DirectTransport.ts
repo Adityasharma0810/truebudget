@@ -12,7 +12,10 @@ export class DirectTransport extends RelayTransport {
       agentHost ||
       import.meta.env?.VITE_AGENT_HTTP_URL ||
       "http://localhost:7443";
-    const httpUrl = raw.replace(/\/$/, "");
+    // The pairing form collects a bare ``host:port``; browsers need an
+    // explicit scheme, so default it to http unless one was provided.
+    const withScheme = /^https?:\/\//i.test(raw) ? raw : `http://${raw}`;
+    const httpUrl = withScheme.replace(/\/$/, "");
     super({ mode: "direct", httpUrl, fingerprint });
   }
 

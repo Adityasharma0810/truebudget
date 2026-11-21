@@ -304,9 +304,16 @@ def _snapshot_to_frontend(core: AgentCore, config: AgentConfig, store: Store) ->
                     },
                 }
             )
+        # A name chosen by the owner must survive the next discovery tick.  The
+        # discovered name lives in core's snapshot, so keep the override in
+        # settings and prefer it here (same pattern as ``person`` below).
+        name_row = store.execute(
+            "SELECT value FROM settings WHERE key=?", (f"ui:device_name:{did}",)
+        ).fetchone()
+        name_override = _json_dict(name_row["value"]).get("value") if name_row else None
         device_out = {
             "id": did,
-            "name": dev.get("name", did),
+            "name": str(name_override) if name_override else dev.get("name", did),
             "qoe": dqoe_val,
             "band": dqoe.get("band", "idle") if isinstance(dqoe, dict) else "idle",
             "flows": flows_out,
@@ -396,7 +403,7 @@ def _snapshot_to_frontend(core: AgentCore, config: AgentConfig, store: Store) ->
             "seed": 0,
         },
         "ts": _iso(snap.ts),
-        "mode": _mode_label(config.mode),
+        "mode": _mode_label(config.mode, _safe_state_active(store)),
         "link": {
             "capacityMbps": round(capacity, 2),
             "capacitySource": getattr(core, "_capacity_source", "prior"),
@@ -435,11 +442,23 @@ def _snapshot_to_frontend(core: AgentCore, config: AgentConfig, store: Store) ->
     }
 
 
-def _mode_label(mode: str) -> str:
-    # Topology mode (gateway/bridge/lab/monitor) is shown separately from the
-    # control-loop state.  Monitor-only is still an adaptive read-only loop, not
+def _mode_label(mode: str, safe_active: bool = False) -> str:
+    # Safe state is a control-loop condition owned by the UI flag, not the
+    # topology mode.  Monitor-only is still an adaptive read-only loop, not
     # the emergency safe state.
+    if safe_active:
+        return "safe_state"
     return "adaptive"
+
+
+def _safe_state_active(store: Store) -> bool:
+    row = store.execute(
+        "SELECT value FROM settings WHERE key='ui:safe_state'"
+    ).fetchone()
+    if not row:
+        return False
+    payload = _json_dict(row["value"]).get("value")
+    return bool(payload.get("active")) if isinstance(payload, dict) else False
 
 
 def _json_dict(raw: Any) -> dict[str, Any]:
@@ -1141,6 +1160,17 @@ def create_app(
             store.execute(
                 f"UPDATE devices SET {', '.join(fields)} WHERE device_id=?", tuple(values)
             )
+        if "name" in body:
+            chosen = str(body.get("name") or "").strip()
+            if chosen:
+                # Discovery rewrites the devices table every slow tick; keep
+                # the owner's label separately so it is not lost.
+                _put_setting(store, f"ui:device_name:{target_id}", chosen)
+            else:
+                store.execute(
+                    "DELETE FROM settings WHERE key=?",
+                    (f"ui:device_name:{target_id}",),
+                )
         if "person" in body:
             _put_setting(store, f"ui:device_person:{target_id}", str(body["person"] or ""))
         store.commit()
@@ -1337,18 +1367,47 @@ def create_app(
             body = {}
         restore = bool(body.get("restore")) if isinstance(body, dict) else False
         now = time.time()
+        safe_row = store.execute(
+            "SELECT value FROM settings WHERE key='ui:safe_state'"
+        ).fetchone()
+        safe_state = (
+            _json_dict(safe_row["value"]).get("value") if safe_row else {}
+        )
+        safe_state = safe_state if isinstance(safe_state, dict) else {}
         if restore:
-            config.mode = "lab"
+            # Return to the mode that was active before the reset instead of
+            # assuming the lab default.
+            config.mode = str(safe_state.get("previousMode") or "lab")
             action = "safe_state.restore"
             target = "control-loop"
             detail = {"mode": config.mode}
             verdict = "restored_adaptive_mode"
+            _put_setting(
+                store,
+                "ui:safe_state",
+                {"active": False, "since": now, "previousMode": config.mode},
+            )
         else:
+            # Preserve the original mode on repeated resets.
+            previous = (
+                safe_state.get("previousMode")
+                if safe_state.get("active")
+                else config.mode
+            )
             config.mode = "monitor"
             action = "safe_state.reset"
             target = "all-intents"
             detail = {"mode": config.mode}
             verdict = "reset_to_safe_state"
+            _put_setting(
+                store,
+                "ui:safe_state",
+                {
+                    "active": True,
+                    "since": now,
+                    "previousMode": str(previous or "lab"),
+                },
+            )
         store.execute("UPDATE intents SET state='cancelled' WHERE state='active'")
         store.execute(
             "INSERT INTO audit_log(ts, actor, action, target, result, details) VALUES (?, ?, ?, ?, ?, ?)",
@@ -1714,7 +1773,10 @@ def create_app(
         for f in flows:
             did = f.get("device_id", "unknown")
             demands[did] = demands.get(did, 0.0) + f.get("bytes_per_s", 0) * 8.0 / 1_000_000.0
-        conflicts = negotiation.detect_conflicts(demands, float(capacity))
+        # GET must be stable: if pressure persists, return the pending conflict
+        # instead of minting a new id on every page load/refetch.
+        pending = [c for c in negotiation.list() if c.status == "pending"]
+        conflicts = pending or negotiation.detect_conflicts(demands, float(capacity))
         return [
             {
                 "id": c.id,
@@ -1885,9 +1947,22 @@ def create_app(
         schedule_id = request.query_params.get("id")
         if not schedule_id:
             raise HTTPException(status_code=400, detail={"code": "bad_request", "message": "missing id"})
-        store.execute("UPDATE demand_schedules SET enabled = 0 WHERE schedule_id = ?", (schedule_id,))
+        store.execute("DELETE FROM demand_schedules WHERE schedule_id = ?", (schedule_id,))
         store.commit()
         return {"ok": True, "id": schedule_id}
+
+    # NOTE: the static ``/scenarios/stop`` route must be declared before
+    # ``/scenarios/{scenario_id}`` or the dynamic route swallows it and starts
+    # a scenario literally named "stop".
+    @app.post("/api/v1/scenarios/stop")
+    async def scenarios_stop():
+        store: Store = app.state.store
+        store.execute(
+            "UPDATE settings SET value = json_set(value, '$.active', 0) "
+            "WHERE key LIKE 'scenario:%' AND json_extract(value, '$.active') = 1"
+        )
+        store.commit()
+        return {"verdict": "scenarios_stopped", "emulated": True}
 
     @app.post("/api/v1/scenarios/{scenario_id}")
     async def scenarios_start(scenario_id: str, request: Request):
@@ -1913,16 +1988,6 @@ def create_app(
         )
         store.commit()
         return {"scenario_id": scenario_id, "active": True, "emulated": True}
-
-    @app.post("/api/v1/scenarios/stop")
-    async def scenarios_stop():
-        store: Store = app.state.store
-        store.execute(
-            "UPDATE settings SET value = json_set(value, '$.active', 0) "
-            "WHERE key LIKE 'scenario:%' AND json_extract(value, '$.active') = 1"
-        )
-        store.commit()
-        return {"verdict": "scenarios_stopped", "emulated": True}
 
     @app.post("/api/v1/experiments")
     async def experiments_start(request: Request, background: BackgroundTasks):
