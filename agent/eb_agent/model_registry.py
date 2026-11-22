@@ -94,12 +94,18 @@ def train_and_activate(
     classifier: FlowClassifier,
     *,
     data_dir: Path | str | None = None,
-    extra_rows: Sequence[dict] | None = None,
+    real_rows: Sequence[dict] | None = None,
     reason: str = "manual",
 ) -> dict[str, Any]:
-    """Train a new model version, save it, and make it active."""
+    """Train a new model version on real labelled rows, save it, activate it.
 
-    metrics = classifier.train(extra_rows)
+    Refuses (without recording anything) when the real-data gate in
+    ``FlowClassifier.train`` is not met.
+    """
+
+    metrics = classifier.train(real_rows)
+    if not metrics.get("trained", True):
+        return metrics
     version = _next_version(store)
     artifact = model_dir(store, data_dir) / f"v{version}.joblib"
     classifier.save(artifact)
@@ -145,24 +151,54 @@ def load_active(
     return None
 
 
+def _deactivate_synthetic_models(store: Store) -> None:
+    """Mark legacy synthetic-trained versions inactive.
+
+    Models fitted on the deterministic lab generator must never answer for
+    live traffic; they stay in the version list for audit but cannot load.
+    """
+
+    rows = store.execute(
+        "SELECT m.model_id FROM models m LEFT JOIN model_metrics mm "
+        "ON mm.model_id=m.model_id WHERE m.kind=? AND m.active=1 "
+        "AND (mm.metrics LIKE '%synthetic_lab_holdout%' OR mm.metrics IS NULL)",
+        (MODEL_KIND,),
+    ).fetchall()
+    if rows:
+        store.execute(
+            "UPDATE models SET active=0 WHERE kind=? AND active=1 AND "
+            "model_id IN (%s)" % ",".join("?" for _ in rows),
+            (MODEL_KIND, *[r["model_id"] for r in rows]),
+        )
+        store.commit()
+
+
 def ensure_classifier(
     store: Store,
     classifier: FlowClassifier,
     *,
     data_dir: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Load the active model at startup, training one when none exists."""
+    """Load the active real-trained model at startup.
 
+    The agent never trains on its own at startup: without real labelled rows
+    there is nothing honest to fit, so the rule baseline answers until a real
+    retrain succeeds.
+    """
+
+    _deactivate_synthetic_models(store)
     loaded = load_active(store, classifier, data_dir=data_dir)
     if loaded is not None:
         return {"ok": True, "loaded": True, "model": loaded}
-    metrics = train_and_activate(
-        store,
-        classifier,
-        data_dir=data_dir,
-        reason="startup_untrained",
-    )
-    return {"ok": True, "loaded": False, "trained": True, "model": metrics}
+    return {
+        "ok": True,
+        "loaded": False,
+        "model": None,
+        "reason": (
+            "No real-trained model available; the deterministic rule baseline "
+            "classifies flows until enough human-labelled flows exist."
+        ),
+    }
 
 
 def rollback(
@@ -259,10 +295,14 @@ def list_models(store: Store) -> list[dict[str, Any]]:
 
 
 def approved_correction_rows(store: Store, limit: int = 500) -> list[dict[str, Any]]:
-    """Features for approved human corrections, ready for retraining."""
+    """Real, human-labelled flow features, ready for retraining.
+
+    Only rows whose features were actually measured for that flow (via the
+    ``flow_features`` table the live collector writes every tick) qualify.
+    """
 
     rows = store.execute(
-        "SELECT c.flow_id, c.confirmed_class, f.pkt_len_mean, f.pkt_len_std, "
+        "SELECT c.flow_id, c.confirmed_class, c.created_at, f.pkt_len_mean, f.pkt_len_std, "
         "f.pkt_len_min, f.pkt_len_max, f.iat_mean, f.iat_std, f.iat_min, f.iat_max, "
         "f.direction_ratio, f.bytes_per_s, f.packets_per_s, f.burstiness, f.duration_s, "
         "f.protocol, fl.src_port, fl.dst_port "
@@ -276,9 +316,12 @@ def approved_correction_rows(store: Store, limit: int = 500) -> list[dict[str, A
     for row in rows:
         item = dict(row)
         label = item.pop("confirmed_class", None)
+        captured_at = item.pop("created_at", None)
         if not label:
             continue
         item["label"] = label
+        if captured_at is not None:
+            item["captured_at"] = float(captured_at)
         item["flow_id"] = item.get("flow_id")
         out.append(item)
     return out

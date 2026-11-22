@@ -470,7 +470,13 @@ def _parse_ss_output(text: str, protocol: str) -> list[dict]:
         if len(parts) < 5:
             continue
         state, recv_q, send_q, local, peer = parts[:5]
-        if state != "ESTAB":
+        # TCP sockets are ESTAB; UDP sockets report UNCONN (unconnected) or
+        # ESTAB (connected).  Without accepting UNCONN every UDP flow - calls,
+        # games, DNS, QUIC - is invisible to classification.
+        if protocol == "udp":
+            if state not in {"UNCONN", "ESTAB"}:
+                continue
+        elif state != "ESTAB":
             continue
         src_ip, src_port = _split_endpoint(local)
         dst_ip, dst_port = _split_endpoint(peer)
@@ -1120,6 +1126,7 @@ class AgentCore:
         # Probe real interface throughput and feed Kalman + CUSUM.
         sample_mbps = self._probe_throughput()
         estimate, cusum_result = self._update_capacity(sample_mbps)
+        socket_flows, _fast_queue = self._read_socket_flows()
         tick = Tick(
             ts=now,
             interval_s=self.config.fast_interval_s,
@@ -1136,6 +1143,7 @@ class AgentCore:
         self._last_tick = tick
         self._last_throughput_mbps = sample_mbps
         self._persist_metrics_raw(now, "throughput_mbps", sample_mbps, "wan")
+        self._persist_flow_features_fast(socket_flows)
         self._update_qoe_warnings(now, estimate.capacity_mbps, sample_mbps)
         if self.on_tick:
             result = self.on_tick(tick)
@@ -2178,6 +2186,71 @@ class AgentCore:
                     f.get("last_seen", now),
                 ),
             )
+            # Persist the features the live collector measured for this flow so
+            # a human correction later joins to real measurements and can train
+            # the local classifier.  Unmeasured statistics stay NULL - they are
+            # never invented.
+            self._upsert_flow_features(f, now)
+        self.store.commit()
+
+    def _upsert_flow_features(self, f: dict, now: float) -> None:
+        self.store.execute(
+                "INSERT OR REPLACE INTO flow_features(flow_id, pkt_len_mean, "
+                "iat_mean, direction_ratio, bytes_per_s, packets_per_s, "
+                "duration_s, protocol, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    f["flow_id"],
+                    f.get("pkt_len_mean"),
+                    f.get("iat_mean_ms"),
+                    f.get("direction_ratio"),
+                    f.get("bytes_per_s"),
+                    f.get("packets_per_s"),
+                    f.get("duration_s"),
+                    f.get("protocol"),
+                    now,
+                ),
+            )
+
+    def _persist_flow_features_fast(self, flows: list[dict]) -> None:
+        """Persist measured flow features every fast tick.
+
+        The slow tick only persists flows every ~30 s, so short-lived flows
+        (video segments, calls) were invisible to the training pipeline.  The
+        fast tick records the same real measurements at ~1.5 s cadence so a
+        human correction always joins to genuine observed features.
+        """
+
+        try:
+            socket_flows, _queue = self._read_socket_flows()
+        except Exception:  # noqa: BLE001 - persistence must never break the tick
+            return
+        now = time.time()
+        devices = self.last_snapshot.devices if self.last_snapshot else []
+        for f in socket_flows:
+            # flow_features has a FK on flows(flow_id); short-lived flows are
+            # only persisted on the slow tick, so make sure the parent row
+            # exists before writing features.
+            device_id = self._device_for_ip(str(f.get("src_ip", "")), devices)
+            if not device_id:
+                continue
+            self.store.execute(
+                "INSERT OR IGNORE INTO flows(flow_id, device_id, class, src_ip, dst_ip, "
+                "src_port, dst_port, protocol, first_seen, last_seen) "
+                "VALUES (?, ?, 'unknown', ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    f["flow_id"],
+                    device_id,
+                    f.get("src_ip"),
+                    f.get("dst_ip"),
+                    f.get("src_port"),
+                    f.get("dst_port"),
+                    f.get("protocol"),
+                    f.get("first_seen", now),
+                    f.get("last_seen", now),
+                ),
+            )
+            self._upsert_flow_features(f, now)
+        self.store.commit()
         self.store.commit()
 
     def _persist_qoe(self, qoe: dict) -> None:

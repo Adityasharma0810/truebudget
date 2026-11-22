@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from eb_agent.classifier import FlowClassifier
+from tests.test_classifier import _real_rows
 from eb_agent.decision_log import DecisionLog, GENESIS_HASH
 from eb_agent.estimator import KalmanEstimator, CUSUMDetector, step_change_detected
 from eb_agent.forecaster import HoltWintersForecaster, ForecasterGate
@@ -38,9 +39,11 @@ def test_full_closed_loop(tmp_store: Store) -> None:
     )
     tmp_store.commit()
 
-    # 2. Classifier: train and classify a flow
+    # 2. Classifier: train on real-shaped labelled rows, then classify a flow
     clf = FlowClassifier()
-    clf.train()
+    gate = clf.train([])
+    assert gate["trained"] is False  # refuses without real labelled rows
+    clf.train(_real_rows())
     result = clf.predict({
         "dst_port": 443,
         "protocol": "TCP",

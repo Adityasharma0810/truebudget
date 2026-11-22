@@ -21,6 +21,7 @@ import importlib.util
 import json
 import logging
 import math
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,12 @@ class QoEWarner:
         self.model_kind = "qoe_lightgbm"
         self._warner: Any | None = None
         self._rtt_history: collections.deque[float] = collections.deque(maxlen=120)
+        # Optional: log every real inference record (features + qoe) to JSONL
+        # for later retraining on real data.  Enabled via EB_QOE_LOG=<path>.
+        self._log_path: Path | None = (
+            Path(os.environ["EB_QOE_LOG"]) if os.environ.get("EB_QOE_LOG") else None
+        )
+        self._log_file: Any | None = None
         self._load()
 
     # ------------------------------------------------------------------ setup
@@ -53,9 +60,12 @@ class QoEWarner:
     def _load(self) -> None:
         runtime = self.bundle_dir / "eb_runtime.py"
         config = self.bundle_dir / "config.json"
-        # The qoe_only_bundle ZIP ships without the joblib (its README says
-        # so); the trained model lives in machine_learning/saved_models/.
-        model = self.bundle_dir / "qoe_predictor.joblib"
+        # A real-trained artifact (env EB_QOE_MODEL) always wins over the
+        # shipped bundle: it was fitted on this agent's own measurements.
+        real_model = os.environ.get("EB_QOE_MODEL", "")
+        model = Path(real_model) if real_model and Path(real_model).is_file() else None
+        if model is None:
+            model = self.bundle_dir / "qoe_predictor.joblib"
         if not model.exists():
             model = self.bundle_dir.parent / "saved_models" / "qoe_predictor.joblib"
         if not (runtime.exists() and model.exists() and config.exists()):
@@ -80,7 +90,7 @@ class QoEWarner:
             self._warner = module.QoEWarner(bundle, horizon_s=self.horizon_s)
             self.threshold = float(self._warner.tau)
             self.available = True
-            self.source = "ml"
+            self.source = "ml_real" if real_model and Path(real_model).is_file() else "ml"
             logger.info(
                 "QoE degradation warner loaded (horizon=%ds, threshold=%.3f)",
                 self.horizon_s,
@@ -207,7 +217,45 @@ class QoEWarner:
                     "source": str(result.get("source", self.source)),
                     "horizonS": self.horizon_s,
                 }
+                self._log_sample(did, float(now), rec, result, q_val, p_red)
         return out
+
+    # ------------------------------------------------------------------ real-sample logging
+
+    def _log_sample(
+        self,
+        device_id: str,
+        now: float,
+        rec: dict[str, Any],
+        result: dict[str, Any],
+        qoe: float | None,
+        p_red: float | None,
+    ) -> None:
+        """Append one real inference record to the EB_QOE_LOG JSONL file.
+
+        Every logged value is a real measurement or derived from one; used to
+        retrain the warner on this agent's own traffic history.
+        """
+
+        if self._log_path is None:
+            return
+        try:
+            if self._log_file is None:
+                self._log_path.parent.mkdir(parents=True, exist_ok=True)
+                self._log_file = self._log_path.open("a", encoding="utf-8")
+            entry = {
+                "device": device_id,
+                "t": now,
+                "qoe": qoe,
+                "state": str(result.get("state", "unknown")),
+                "p_red": p_red,
+                "record": {k: v for k, v in rec.items() if v is not None},
+                "features": result.get("features"),
+            }
+            self._log_file.write(json.dumps(entry) + "\n")
+            self._log_file.flush()
+        except Exception as error:  # noqa: BLE001 - logging must never break inference
+            logger.debug("qoe warner log failed: %s", error)
 
     # ------------------------------------------------------------------ introspection
 
@@ -224,6 +272,7 @@ class QoEWarner:
             "modelKind": self.model_kind,
             "horizonS": self.horizon_s if self.available else None,
             "threshold": self.threshold,
+            "source": self.source,
             "bundleDir": str(self.bundle_dir),
             "enabledInConfig": bool(cfg.get("enabled", False)) if cfg else False,
         }

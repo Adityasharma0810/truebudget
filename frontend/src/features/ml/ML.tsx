@@ -31,6 +31,7 @@ export default function ML() {
     modelKind?: string;
     horizonS?: number | null;
     threshold?: number | null;
+    trainedOnRealData?: boolean;
     devices?: Array<{
       deviceId: string;
       state: string;
@@ -59,7 +60,6 @@ export default function ML() {
         title="Intelligence, with its workings shown."
         description="Classifier quality, honest uncertainty, and a human in the loop."
       >
-        <Badge tone="emulated">Synthetic evaluation</Badge>
         <Button
           variant="secondary"
           pending={task.isPending}
@@ -120,7 +120,7 @@ export default function ML() {
             </strong>
             <p>
               {warnQuery.data?.available
-                ? `Predicts a device entering the poor-QoE state about ${warnQuery.data.horizonS ?? 10}s ahead. Alert threshold p(red) ≥ ${(warnQuery.data.threshold ?? 0).toFixed(3)}, stored in the trained bundle. Fed only measured RTT, jitter, loss, capacity and per-class flow counts.`
+                ? `Predicts a device entering the poor-QoE state about ${warnQuery.data.horizonS ?? 10}s ahead. Alert threshold p(red) ≥ ${(warnQuery.data.threshold ?? 0).toFixed(3)}, stored in the trained bundle. ${warnQuery.data.trainedOnRealData ? "Trained on this agent's own real measurements (logged live congestion history)." : "Trained on the bundled simulation dataset; treat alerts as unvalidated until retrained on real data."} Fed only measured RTT, jitter, loss, capacity and per-class flow counts.`
                 : "The trained bundle (machine_learning/qoe_only_bundle) is not available to this agent, so early warning falls back to the QoE-level rule."}
             </p>
             {warnQuery.data?.available && (warnQuery.data.devices?.length ?? 0) > 0 && (
@@ -333,7 +333,8 @@ export default function ML() {
       </section>
       <div className="page-note">
         <Info size={13} /> Model versions are read from the agent's local database. Retrain and
-        rollback are refused until a real training job exists; no synthetic model metrics are shown.
+        rollback only use real, human-labelled flows measured by this agent; no synthetic model
+        metrics are shown.
       </div>
     </>
   );

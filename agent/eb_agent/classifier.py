@@ -19,10 +19,14 @@ from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassif
 from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
 from sklearn.model_selection import train_test_split
 
-from eb_agent.lab.traffic_gen import CLASSES, generate_flow_dataset
-
-CLASS_LABELS = list(CLASSES)
+CLASS_LABELS = ["call", "game", "stream", "bulk", "unknown"]
 DEFAULT_THRESHOLD = 0.6
+
+# Real-data gate: the live classifier is only trained on features the agent
+# actually measured for flows a human labelled through the correction UI.
+# Below this floor the rule baseline answers and the API says so plainly.
+MIN_REAL_ROWS = 20
+MIN_ROWS_PER_CLASS = 5
 
 # Only features the agent can measure for a live flow belong here.  Earlier
 # versions also used packet-size / inter-arrival distributions, but the live
@@ -180,39 +184,6 @@ class FlowClassifier:
         normalised = normalise_features(features)
         return [float(normalised[name]) for name in FEATURE_NAMES]
 
-    def _train_on_dataset(self, rows: Sequence[dict]) -> None:
-        X = np.array([self._feature_vector(r) for r in rows])
-        y = np.array([str(r["label"]) for r in rows])
-
-        # A class with a single sample cannot be stratified; fall back to a
-        # random split in that (rare, correction-heavy) case.
-        counts = {label: int((y == label).sum()) for label in set(y)}
-        stratify = y if min(counts.values()) >= 3 else None
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42, stratify=stratify
-        )
-
-        rf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=1)
-        hgb = HistGradientBoostingClassifier(random_state=42)
-
-        rf.fit(X_train, y_train)
-        hgb.fit(X_train, y_train)
-
-        rf_f1 = f1_score(y_test, rf.predict(X_test), average="macro")
-        hgb_f1 = f1_score(y_test, hgb.predict(X_test), average="macro")
-
-        best = rf if rf_f1 >= hgb_f1 else hgb
-        self._model_kind = type(best).__name__
-        try:
-            calibrated = CalibratedClassifierCV(best, cv=3, method="isotonic")
-            calibrated.fit(X_train, y_train)
-            self._model = calibrated
-            self._model_kind = f"{type(best).__name__} + isotonic calibration"
-        except Exception:
-            # Calibration is an accuracy aid, not a correctness requirement.
-            self._model = best
-        self._trained = True
-
     @staticmethod
     def _rule_class(row: dict) -> str:
         observed = normalise_features(row)
@@ -243,36 +214,93 @@ class FlowClassifier:
             "n_test": len(rows),
         }
 
-    def train(self, extra_rows: Sequence[dict] | None = None) -> dict:
-        """Train on synthetic lab features plus approved corrections.
+    def train(self, real_rows: Sequence[dict]) -> dict:
+        """Train only on real, human-labelled flow features.
 
-        The held-out evaluation uses a *separate* synthetic dataset (seed 99)
-        never shown to the model, so the reported matrix is a genuine holdout
-        for that data source.  It is still lab data, not ISP measurements —
-        callers must keep that label attached.
+        Every row must carry a ``label`` from the correction UI plus the
+        features the live collector measured for that exact flow (joined via
+        ``flow_features``).  Synthetic/lab-generated rows are refused here by
+        design: a model fitted on invented feature values must never answer
+        for live traffic.
+
+        The holdout is the *most recent* 20% of real rows (chronological), so
+        the reported metrics describe measured traffic, not a simulation.
         """
 
         with self._lock:
-            rows = list(generate_flow_dataset(seed=42, rows_per_class=200))
-            extra = [r for r in (extra_rows or []) if r.get("label") in CLASS_LABELS]
-            rows.extend(extra)
-            self._feature_names = list(FEATURE_NAMES)
-            self._train_on_dataset(rows)
+            rows = [
+                r for r in (real_rows or []) if str(r.get("label")) in CLASS_LABELS
+            ]
+            counts: dict[str, int] = {}
+            for r in rows:
+                counts[str(r["label"])] = counts.get(str(r["label"]), 0) + 1
+            usable_classes = sum(1 for n in counts.values() if n >= MIN_ROWS_PER_CLASS)
+            if len(rows) < MIN_REAL_ROWS or usable_classes < 2:
+                return {
+                    "ok": False,
+                    "trained": False,
+                    "n_real_rows": len(rows),
+                    "class_counts": counts,
+                    "min_real_rows": MIN_REAL_ROWS,
+                    "min_rows_per_class": MIN_ROWS_PER_CLASS,
+                    "reason": (
+                        f"Only {len(rows)} real labelled flow(s) with "
+                        f"{usable_classes} class(es) at >= {MIN_ROWS_PER_CLASS} rows. "
+                        f"Need >= {MIN_REAL_ROWS} rows across >= 2 classes before a "
+                        "model may train; the rule baseline keeps answering until "
+                        "then. Correct flows in the usage tree to add real labels."
+                    ),
+                }
 
-            # Evaluate on held-out holdout generated with a different seed.
-            test_rows = generate_flow_dataset(seed=99, rows_per_class=50)
+            # Chronological split: oldest rows train, newest rows evaluate.
+            rows = sorted(rows, key=lambda r: float(r.get("captured_at") or 0.0))
+            cut = max(1, int(len(rows) * 0.8))
+            train_rows, test_rows = rows[:cut], rows[cut:]
+            if not train_rows or not test_rows:
+                train_rows, test_rows = rows, rows
+
+            X = np.array([self._feature_vector(r) for r in train_rows])
+            y = np.array([str(r["label"]) for r in train_rows])
+
+            rf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=1)
+            hgb = HistGradientBoostingClassifier(random_state=42)
+
+            rf.fit(X, y)
+            hgb.fit(X, y)
+
+            X_test = np.array([self._feature_vector(r) for r in test_rows])
+            y_test = np.array([str(r["label"]) for r in test_rows])
+            rf_f1 = f1_score(y_test, rf.predict(X_test), average="macro", zero_division=0)
+            hgb_f1 = f1_score(y_test, hgb.predict(X_test), average="macro", zero_division=0)
+
+            best = rf if rf_f1 >= hgb_f1 else hgb
+            self._model_kind = type(best).__name__
+            try:
+                calibrated = CalibratedClassifierCV(best, cv=3, method="isotonic")
+                calibrated.fit(X, y)
+                self._model = calibrated
+                self._model_kind = f"{type(best).__name__} + isotonic calibration"
+            except Exception:
+                # Calibration is an accuracy aid, not a correctness requirement.
+                self._model = best
+            self._trained = True
+            self._feature_names = list(FEATURE_NAMES)
+
             metrics = self._evaluate(test_rows)
             metrics.update(
                 {
-                    "n_train": len(rows),
-                    "n_extra": len(extra),
+                    "ok": True,
+                    "trained": True,
+                    "n_train": len(train_rows),
+                    "n_extra": 0,
                     "model_kind": self._model_kind,
                     "threshold": float(self.threshold),
-                    "source": "synthetic_lab_holdout",
+                    "source": "real_flow_corrections",
                     "note": (
-                        "Trained and evaluated on the deterministic lab traffic "
-                        "generator; held-out seed 99. Not evidence of real-ISP "
-                        "accuracy."
+                        f"Trained on {len(train_rows)} human-labelled flows whose "
+                        "features the agent measured live; evaluated on the "
+                        f"{len(test_rows)} most recent labelled flows. No synthetic "
+                        "data was used."
                     ),
                 }
             )

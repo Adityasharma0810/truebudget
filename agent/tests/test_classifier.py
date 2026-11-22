@@ -55,19 +55,64 @@ def test_classifier_predict_untrained_uses_rule() -> None:
     assert result.predicted_class == "game"
 
 
-def test_classifier_train_and_predict() -> None:
+def _real_rows(n_per_class: int = 10, seed: int = 7) -> list[dict]:
+    """Test fixture shaped like real correction rows: live-measured features
+    plus a human label. Tests may synthesise rows; the agent cannot."""
+
+    import random
+
+    rng = random.Random(seed)
+    profiles = {
+        "call": dict(dst_port=3478, protocol="UDP", direction_ratio=0.5, bytes_per_s=60_000, packets_per_s=50, pkt_len_mean=180, iat_mean_ms=20, duration_s=600),
+        "stream": dict(dst_port=443, protocol="TCP", direction_ratio=0.1, bytes_per_s=3_000_000, packets_per_s=2500, pkt_len_mean=1200, iat_mean_ms=0.4, duration_s=900),
+        "bulk": dict(dst_port=443, protocol="TCP", direction_ratio=0.05, bytes_per_s=9_000_000, packets_per_s=7500, pkt_len_mean=1400, iat_mean_ms=0.13, duration_s=1800),
+    }
+    rows: list[dict] = []
+    for label, base in profiles.items():
+        for i in range(n_per_class):
+            row = dict(base)
+            for key in ("bytes_per_s", "packets_per_s", "pkt_len_mean", "direction_ratio"):
+                row[key] = float(row[key]) * rng.uniform(0.8, 1.2)
+            row["label"] = label
+            row["captured_at"] = 1000.0 + i
+            rows.append(row)
+    return rows
+
+
+def test_classifier_refuses_without_real_rows() -> None:
     clf = FlowClassifier()
-    metrics = clf.train()
+    metrics = clf.train([])
+    assert metrics["trained"] is False
+    assert not clf.is_trained
+    assert metrics["n_real_rows"] == 0
+
+
+def test_classifier_train_on_real_rows_and_predict() -> None:
+    clf = FlowClassifier()
+    metrics = clf.train(_real_rows())
+    assert metrics["trained"] is True
+    assert metrics["source"] == "real_flow_corrections"
     assert "macro_f1" in metrics
     assert metrics["macro_f1"] >= 0.0
-    result = clf.predict({"dst_port": 27015, "protocol": "UDP", "direction_ratio": 0.5})
+    result = clf.predict(
+        {
+            "dst_port": 443,
+            "protocol": "TCP",
+            "direction_ratio": 0.1,
+            "bytes_per_s": 3_000_000,
+            "packets_per_s": 2500,
+            "pkt_len_mean": 1200,
+            "iat_mean_ms": 0.4,
+            "duration_s": 900,
+        }
+    )
     assert result.predicted_class in CLASS_LABELS
     assert 0.0 <= result.confidence <= 1.0
 
 
 def test_classifier_unknown_below_threshold() -> None:
     clf = FlowClassifier(threshold=0.99)
-    clf.train()
+    clf.train(_real_rows())
     # With high threshold, most predictions fall back to rule
     result = clf.predict({"dst_port": 443, "protocol": "TCP", "direction_ratio": 0.5, "bytes_per_s": 1000000, "duration_s": 300})
     # Either ml with low confidence → rule, or rule directly

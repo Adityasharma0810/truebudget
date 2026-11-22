@@ -1429,6 +1429,7 @@ def create_app(
             "modelKind": status.get("modelKind"),
             "horizonS": status.get("horizonS"),
             "threshold": status.get("threshold"),
+            "trainedOnRealData": status.get("source") == "ml_real",
             "ts": time.time(),
             "devices": [
                 {"deviceId": did, **w} for did, w in warnings.items()
@@ -1556,14 +1557,14 @@ def create_app(
         store: Store = app.state.store
         core: AgentCore = app.state.core
         config: AgentConfig = app.state.config
-        extra_rows = model_registry.approved_correction_rows(store)
+        real_rows = model_registry.approved_correction_rows(store)
         try:
             result = await asyncio.to_thread(
                 model_registry.train_and_activate,
                 store,
                 core.classifier,
                 data_dir=config.data_dir,
-                extra_rows=extra_rows,
+                real_rows=real_rows,
                 reason="api_retrain",
             )
         except Exception as error:  # noqa: BLE001 - surface the real failure
@@ -1571,13 +1572,22 @@ def create_app(
             return {
                 "ok": False,
                 "trained": False,
-                "approvedCorrections": len(extra_rows),
+                "approvedCorrections": len(real_rows),
                 "reason": f"Local retrain failed: {error}",
+            }
+        if not result.get("trained", True):
+            # Real-data gate refused the run; nothing was recorded or activated.
+            return {
+                "ok": False,
+                "trained": False,
+                "approvedCorrections": len(real_rows),
+                "classCounts": result.get("class_counts") or {},
+                "reason": result.get("reason", "Not enough real labelled flows."),
             }
         return {
             "ok": True,
             "trained": True,
-            "approvedCorrections": len(extra_rows),
+            "approvedCorrections": len(real_rows),
             "version": result.get("version"),
             "accuracy": result.get("accuracy"),
             "macroF1": result.get("macro_f1"),
@@ -1586,8 +1596,8 @@ def create_app(
             "nTest": result.get("n_test"),
             "modelKind": result.get("model_kind"),
             "reason": (
-                "Trained on the deterministic lab generator plus approved local "
-                "corrections; evaluated on a held-out synthetic split."
+                "Trained only on human-labelled flows whose features the agent "
+                "measured live; evaluated on the most recent labelled flows."
             ),
         }
 

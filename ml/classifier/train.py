@@ -28,12 +28,33 @@ import sqlite3
 from collections import defaultdict
 from pathlib import Path
 
-from backend.app.services.classifier_service import (
-    CLASSIFIER_CLASSES,
-    CONFIDENCE_THRESHOLD,
-    extract_features,
-)
-from backend.app.models.schemas import TelemetryObservation
+# The historical `backend` package no longer exists in this repo; the tiny
+# feature contract it provided is defined here so the offline trainer works.
+CLASSIFIER_CLASSES = ("call", "game", "stream", "bulk", "unknown")
+CONFIDENCE_THRESHOLD = 0.6
+
+
+class TelemetryObservation:
+    """Minimal observation container (rates only; no payload data)."""
+
+    def __init__(self, metadata: dict, download_mbps=None, upload_mbps=None):
+        self.metadata = metadata
+        self.download_mbps = download_mbps
+        self.upload_mbps = upload_mbps
+
+
+def extract_features(obs: TelemetryObservation) -> dict:
+    down = obs.download_mbps or 0.0
+    up = obs.upload_mbps or 0.0
+    total = down + up
+    return {
+        "download_mbps": down,
+        "upload_mbps": up,
+        "rate_ratio_down": (down / total) if total else None,
+        "direction_ratio_up": (up / total) if total else None,
+        "mean_packet_size_bytes": None,  # not collected by the lab
+    }
+
 
 REPO = Path(__file__).resolve().parents[2]
 RUNS_DIR = REPO / "data" / "scenario_runs"
