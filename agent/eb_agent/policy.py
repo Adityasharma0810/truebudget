@@ -123,11 +123,14 @@ def max_min_allocate(
             rates[f.flow_id] = f.min_rate_mbps
             remaining -= f.min_rate_mbps
 
-        # Second pass: raise rates to reach target QoE t
+        # Second pass: raise rates to reach target QoE t.  Flows with a
+        # higher weight (active intent boosts) are served first, so a
+        # temporary owner priority genuinely wins headroom.
+        ordered = sorted(flows, key=lambda f: -float(getattr(f, "weight", 1.0) or 1.0))
         changed = True
         while changed and remaining > 0.001:
             changed = False
-            for f in flows:
+            for f in ordered:
                 current = rates[f.flow_id]
                 current_qoe = _qoe_for_class(f.traffic_class, current, capacity_mbps)
                 if current_qoe < t and remaining > 0.001:

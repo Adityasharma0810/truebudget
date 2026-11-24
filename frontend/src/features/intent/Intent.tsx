@@ -33,7 +33,16 @@ export default function Intent() {
   const { data: intents = [], error } = useApi<IntentType[]>("/intents", { refetchInterval: 3000 });
   const [device, setDevice] = useState(snapshot.devices[0]?.id ?? "");
   const [cls, setCls] = useState("call");
-  const [goal, setGoal] = useState("Prioritize my work call");
+  // Suggested goal text follows the chosen class until the user types their
+  // own, so a "Game" boost never sits under a "work call" title.
+  const GOAL_SUGGESTIONS: Record<string, string> = {
+    call: "Prioritize my work call",
+    game: "Prioritize my game session",
+    stream: "Prioritize my streaming",
+    bulk: "Speed up my large download",
+  };
+  const [goal, setGoal] = useState(GOAL_SUGGESTIONS.call);
+  const [goalTouched, setGoalTouched] = useState(false);
   const [priority, setPriority] = useState("high");
   const [duration, setDuration] = useState("3600");
   const [deadline, setDeadline] = useState("");
@@ -107,7 +116,14 @@ export default function Intent() {
               </label>
               <label className="field-label">
                 Traffic class
-                <select value={cls} onChange={(e) => setCls(e.target.value)}>
+                <select
+                  value={cls}
+                  onChange={(e) => {
+                    const next = e.target.value;
+                    setCls(next);
+                    if (!goalTouched) setGoal(GOAL_SUGGESTIONS[next] ?? `Prioritize my ${next}`);
+                  }}
+                >
                   {capabilities?.classes
                     .filter((c) => c !== "unknown")
                     .map((c) => (
@@ -125,7 +141,10 @@ export default function Intent() {
                 minLength={3}
                 maxLength={140}
                 value={goal}
-                onChange={(e) => setGoal(e.target.value)}
+                onChange={(e) => {
+                  setGoal(e.target.value);
+                  setGoalTouched(true);
+                }}
                 placeholder="e.g. Keep my work call clear"
               />
             </label>

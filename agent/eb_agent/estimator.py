@@ -86,7 +86,7 @@ class KalmanEstimator:
         self.P[1][1] = max(0.0, P11 - K1 * P01)
 
         variance = max(0.0, self.P[0][0])
-        sigma = variance ** 0.5
+        sigma = max(variance ** 0.5, max(4.0, 0.03 * self.capacity))
         return Estimate(
             capacity_mbps=max(1.0, self.capacity),
             variance=variance,
@@ -99,7 +99,7 @@ class KalmanEstimator:
         """Return current estimate without a new measurement."""
 
         variance = max(0.0, self.P[0][0])
-        sigma = variance ** 0.5
+        sigma = max(variance ** 0.5, max(4.0, 0.03 * self.capacity))
         return Estimate(
             capacity_mbps=max(1.0, self.capacity),
             variance=variance,

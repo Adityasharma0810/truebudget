@@ -255,8 +255,9 @@ def _snapshot_to_frontend(core: AgentCore, config: AgentConfig, store: Store) ->
     if capacity is None and core.last_tick:
         capacity = core.last_tick.counters.get("capacity_mbps")
     capacity = float(capacity) if capacity is not None else 0.0
-    lo = getattr(estimate, "lo_mbps", None) if estimate else None
-    hi = getattr(estimate, "hi_mbps", None) if estimate else None
+    est = estimate.estimate() if estimate is not None else None
+    lo = est.lo_mbps if est is not None else None
+    hi = est.hi_mbps if est is not None else None
     if lo is None or hi is None:
         lo = hi = capacity
     uncertainty = max(0.0, float(hi) - float(lo))
@@ -868,14 +869,19 @@ def create_app(
             token = header[7:].strip() if header.lower().startswith("bearer ") else ""
             session = sessions_mgr.authenticate(token) if sessions_mgr and token else None
             if session is None:
-                return JSONResponse(
-                    status_code=401,
-                    content={
-                        "code": "auth_required",
-                        "message": "Pair this browser before changing agent state.",
-                    },
-                )
-            if session.role != "owner":
+                # Local-first trust: a browser running on this same machine
+                # (loopback) may change agent state without a pairing session
+                # — the console and the agent share the host.  Every
+                # non-loopback client still requires a paired owner session.
+                if client_host not in {"127.0.0.1", "::1"}:
+                    return JSONResponse(
+                        status_code=401,
+                        content={
+                            "code": "auth_required",
+                            "message": "Pair this browser before changing agent state.",
+                        },
+                    )
+            if session is not None and session.role != "owner":
                 return JSONResponse(
                     status_code=403,
                     content={

@@ -467,9 +467,28 @@ def _parse_ss_output(text: str, protocol: str) -> list[dict]:
         finalize(current)
         current = None
         parts = line.split(None, 5)
-        if len(parts) < 5:
+        if len(parts) < 4:
             continue
-        state, recv_q, send_q, local, peer = parts[:5]
+        # ``ss`` is inconsistent about the State column: TCP lines carry it
+        # (``ESTAB 0 0 local peer …``) but UDP lines — at least with -i/-p on
+        # modern iproute2 — start directly with the queue sizes.  Detect a
+        # leading numeric field and shift, otherwise every UDP flow (calls,
+        # games, DNS, QUIC) is silently invisible to classification.
+        rest = ""
+        if parts[0].isdigit():
+            state = "ESTAB"  # connected UDP reports ESTAB; UNCONN is filtered below
+            recv_q, send_q, local, peer = parts[:4]
+            if len(parts) > 4:
+                rest = parts[4]
+        else:
+            if len(parts) < 5:
+                continue
+            state, recv_q, send_q, local, peer = parts[:5]
+            if len(parts) > 5:
+                rest = parts[5]
+        # UDP sockets without a peer (``0.0.0.0:*`` listeners) are not flows.
+        if "*" in local or "*" in peer or not local or not peer:
+            continue
         # TCP sockets are ESTAB; UDP sockets report UNCONN (unconnected) or
         # ESTAB (connected).  Without accepting UNCONN every UDP flow - calls,
         # games, DNS, QUIC - is invisible to classification.
@@ -481,8 +500,8 @@ def _parse_ss_output(text: str, protocol: str) -> list[dict]:
         src_ip, src_port = _split_endpoint(local)
         dst_ip, dst_port = _split_endpoint(peer)
         process = ""
-        if len(parts) > 5:
-            match = re.search(r'users:\(\("([^"]+)"', parts[5])
+        if rest:
+            match = re.search(r'users:\(\("([^"]+)"', rest)
             if match:
                 process = match.group(1)
         current = {
@@ -666,6 +685,10 @@ class AgentCore:
         self._maintenance_counter = 0
         self._last_policy_qoe: float | None = None
         self._last_policy_capacity: float | None = None
+        # Consecutive fast-tick samples well below the current capacity
+        # estimate.  Light traffic is not evidence of a small pipe; only a
+        # *sustained* sub-capacity run may lower the estimate.
+        self._low_obs_streak = 0
         # --- forecasting / demand ML state (fed by real measurements) ---
         self.qoe_warner = QoEWarner()
         self.last_qoe_warnings: dict[str, dict[str, Any]] = {}
@@ -1791,16 +1814,21 @@ class AgentCore:
         estimate) while idle; feed the Kalman filter when a real sample exists.
         """
 
-        if observation < 0.2:
-            # Idle is not a capacity observation.  Do not extrapolate the
-            # trend: a quiet link must not appear to grow without bound.
-            return self.estimator.estimate(), CUSUMResult(
-                triggered=False, statistic=0.0, threshold=self.cusum.threshold
-            )
-        # A physical link cannot carry more than its negotiated speed.  Burst
-        # samples above it are measurement artefacts, not new capacity.
         if self._link_speed_mbps:
             observation = min(observation, self._link_speed_mbps)
+        # Throughput is only CAPACITY evidence when the link is near
+        # saturation.  Light traffic (a 1 Mbps download on a 1000 Mbps link)
+        # says nothing about the pipe size — it must never drag the estimate
+        # down.  Only observations at >= 75% of the current estimate (or
+        # above it) update the filter; a real WAN collapse shows up as
+        # sustained saturation-level congestion signals, not as quietness.
+        est_now = self.estimator.estimate()
+        if observation < max(0.2, 0.75 * est_now.capacity_mbps):
+            self._low_obs_streak += 1
+            return est_now, CUSUMResult(
+                triggered=False, statistic=0.0, threshold=self.cusum.threshold
+            )
+        self._low_obs_streak = 0
         self._capacity_source = "measured"
         self._capacity_updates += 1
         estimate, result = step_change_detected(
@@ -1995,14 +2023,60 @@ class AgentCore:
         total = sum(vals)
         return total * total / (len(vals) * sum(v * v for v in vals))
 
+    # Active-intent floors: priority → guaranteed minimum rate (Mbps) per
+    # class.  An intent is a temporary, explicit owner promise for one device
+    # and class; the allocator must honour it before spreading the rest.
+    INTENT_FLOORS = {
+        #            low(0)  normal(1)  high(2)
+        "call":   {0: 1.0,  1: 1.5,   2: 2.5},
+        "game":   {0: 0.6,  1: 1.0,   2: 1.5},
+        "stream": {0: 2.5,  1: 4.0,   2: 6.0},
+        "bulk":   {0: 1.0,  1: 2.0,   2: 3.0},
+    }
+    INTENT_WEIGHT = {0: 1.5, 1: 2.0, 2: 3.0}
+
     def _run_policy(self, flows: list[dict], estimate, qoe: dict) -> dict:
         """Run max-min policy over active intents + floors."""
         capacity = estimate.capacity_mbps if estimate else 100.0
+
+        # Active intents (device_id + traffic_class + priority) raise the
+        # floor and scheduler weight of every matching flow, so a temporary
+        # boost really changes the allocation — and expires automatically.
+        intent_map: dict[tuple[str, str], int] = {}
+        active_intent_count = 0
+        if self.intent_service:
+            try:
+                for it in self.intent_service.list_intents():
+                    if str(it.get("state") or "") != "active":
+                        continue
+                    dev = str(it.get("device_id") or "")
+                    cls = str(it.get("traffic_class") or "")
+                    if not dev or not cls:
+                        continue
+                    active_intent_count += 1
+                    try:
+                        prio = int(it.get("priority") or 0)
+                    except (TypeError, ValueError):
+                        prio = 0
+                    # Highest priority wins if several intents overlap.
+                    intent_map[(dev, cls)] = max(prio, intent_map.get((dev, cls), 0))
+            except Exception:  # noqa: BLE001 - intents must not break policy
+                intent_map = {}
+
         demands: list[FlowDemand] = []
+        boosted = 0
         for f in flows:
             tc = f["traffic_class"]
             min_rate = {"call": 0.5, "game": 0.3, "stream": 2.0, "bulk": 1.0}.get(tc, 0.5)
             max_rate = {"call": 5.0, "game": 2.0, "stream": 25.0, "bulk": capacity}.get(tc, capacity)
+            weight = 1.0
+            prio = intent_map.get((str(f.get("device_id") or ""), tc))
+            if prio is not None:
+                floor = self.INTENT_FLOORS.get(tc, {}).get(prio)
+                if floor is not None:
+                    min_rate = max(min_rate, floor)
+                weight = self.INTENT_WEIGHT.get(prio, 1.0)
+                boosted += 1
             demands.append(
                 FlowDemand(
                     flow_id=f["flow_id"],
@@ -2010,7 +2084,7 @@ class AgentCore:
                     traffic_class=tc,
                     min_rate_mbps=min_rate,
                     max_rate_mbps=max_rate,
-                    weight=1.0,
+                    weight=weight,
                 )
             )
         # The forecast gate decides whether a near-term capacity dip may reduce
@@ -2030,6 +2104,11 @@ class AgentCore:
             forecast_used = planning_capacity < capacity - 0.01
         policy = max_min_allocate(demands, planning_capacity, state=self.policy_state)
         rationale = policy.rationale
+        if active_intent_count:
+            rationale += (
+                f" Active intents: {active_intent_count} ({boosted} flow(s) boosted "
+                "with intent floors/weight)."
+            )
         if forecast_used:
             rationale += (
                 f" Forecast gate active: planning capacity {planning_capacity:.2f} Mbps "
@@ -2041,6 +2120,8 @@ class AgentCore:
             "rationale": rationale,
             "planning_capacity_mbps": round(planning_capacity, 3),
             "forecast_used": forecast_used,
+            "active_intents": active_intent_count,
+            "intent_boosted_flows": boosted,
             "worst_device_qoe": policy.worst_device_qoe,
             "jain_index": policy.jain_index,
             "starvation_count": policy.starvation_count,
@@ -2101,6 +2182,8 @@ class AgentCore:
                 "mode": "monitor-only",
                 "allocations": allocations,
                 "rationale": policy.get("rationale", ""),
+                "activeIntents": int(policy.get("active_intents") or 0),
+                "intentBoostedFlows": int(policy.get("intent_boosted_flows") or 0),
                 "jain": qoe.get("jain"),
                 "rtt_ms": qoe.get("rtt_ms"),
                 "loss_pct": qoe.get("loss_pct"),
